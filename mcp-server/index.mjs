@@ -145,6 +145,10 @@ async function ragQuery({ query, storeNames, model = "gemini-2.5-flash", systemP
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
+app.use((req, res, next) => {
+    console.log(`[MCP] ${req.method} ${req.url} - headers: ${JSON.stringify(req.headers)}`);
+    next();
+});
 app.get("/", (req, res) => res.send("Gemini RAG MCP Server is alive."));
 
 // Per-connection userId store (connection → userId)
@@ -152,12 +156,25 @@ const connectionUsers = new Map(); // transportId → userId
 
 // Auth middleware
 const auth = async (req, res, next) => {
+    let token = "";
     const header = req.headers.authorization;
-    if (!header?.startsWith("Bearer ")) {
-        return res.status(401).json({ error: "Missing Authorization header. Use: Bearer <mcp-api-key>" });
+    if (header?.startsWith("Bearer ")) {
+        token = header.slice(7);
+    } else if (req.query.token) {
+        token = req.query.token;
     }
-    const { userId, valid } = await resolveUser(header.slice(7));
-    if (!valid) return res.status(403).json({ error: "Invalid or inactive MCP API key." });
+
+    if (!token) {
+        console.warn(`[MCP] Rejecting connection: Missing token`);
+        return res.status(401).json({ error: "Missing token. Use Bearer header or ?token= query param." });
+    }
+
+    const { userId, valid } = await resolveUser(token);
+    if (!valid) {
+        console.warn(`[MCP] Rejecting connection: Invalid token ${token.slice(0, 8)}...`);
+        return res.status(403).json({ error: "Invalid or inactive MCP API key." });
+    }
+    console.log(`[MCP] Auth success for user ${userId}`);
     req.userId = userId;
     next();
 };
@@ -168,6 +185,7 @@ const server = new McpServer({ name: "gemini-rag", version: "2.0.0" });
 // userId is resolved per-connection and stored in connectionUsers.
 // Each tool reads it via the module-level currentUserId (safe for SSE: 1 connection = 1 user at a time).
 let currentUserId = null;
+let transport = null;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. chat  ▸ The primary tool — chat with documents in the active store
@@ -473,21 +491,31 @@ Tip: Start with list_stores, then call chat to ask questions.`
     })
 );
 
-// ── SSE transport (one connection at a time) ──────────────────────────────────
-let transport = null;
-
-app.get("/sse", auth, async (req, res) => {
+const handleSse = async (req, res) => {
     currentUserId = req.userId;
-    console.log(`[MCP] SSE connected (userId: ${currentUserId || "dev-mode"})`);
-    transport = new SSEServerTransport("/messages", res);
+    const endpoint = req.url.split('?')[0]; // e.g. /sse or /mcp
+    console.log(`[MCP] SSE connected at ${endpoint} (userId: ${currentUserId || "dev-mode"})`);
+    transport = new SSEServerTransport(endpoint, res);
     await server.connect(transport);
-});
+};
 
-app.post("/messages", auth, express.json(), async (req, res) => {
-    if (!transport) return res.status(400).send("No active SSE connection.");
-    currentUserId = req.userId; // keep userId fresh on each message
+const handlePost = async (req, res) => {
+    if (!transport) {
+        console.warn(`[MCP] POST rejected: No active SSE connection for ${req.url}`);
+        return res.status(400).send("No active SSE connection. Connect via GET /sse first.");
+    }
+    currentUserId = req.userId;
+    console.log(`[MCP] POST message received at ${req.url}`);
     await transport.handlePostMessage(req, res);
-});
+};
+
+app.get("/sse", auth, handleSse);
+app.post("/sse", auth, express.json(), handlePost);
+
+app.get("/mcp", auth, handleSse);
+app.post("/mcp", auth, express.json(), handlePost);
+
+app.post("/messages", auth, express.json(), handlePost);
 
 const PORT = process.env.MCP_PORT || 3001;
 app.listen(PORT, () => {

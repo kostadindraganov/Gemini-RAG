@@ -9,6 +9,10 @@ const nextConfig: NextConfig = {
                 destination: "http://localhost:3001/sse",
             },
             {
+                source: "/mcp",
+                destination: "http://localhost:3001/mcp",
+            },
+            {
                 source: "/messages",
                 destination: "http://localhost:3001/messages",
             },
