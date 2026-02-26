@@ -216,7 +216,6 @@ function toStoreName(id) {
 async function getDocumentsByUser(userId, storeId, limit = 100) {
     const params = {
         "user_id": `eq.${userId}`,
-        "deleted_at": "is.null",
         "select": "id,display_name,original_filename,store_id,mime_type",
         "order": "uploaded_at.desc",
         "limit": String(Math.min(limit, 500)),
