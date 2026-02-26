@@ -1,39 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getGeminiClient } from "@/lib/gemini";
-import { getSupabaseServer } from "@/lib/supabase";
-import { getDocuments, deleteDocumentDB, upsertStore, getStores } from "@/lib/db";
+import { getDocuments, deleteDocumentDB, upsertStore, getStores, getAuthUser, getAuthUserFromCookie } from "@/lib/db";
 import fs from "fs";
 import path from "path";
-
-async function getUser(req: NextRequest) {
-    const authHeader = req.headers.get("authorization");
-    const cookieHeader = req.headers.get("cookie");
-    if (authHeader) {
-        const token = authHeader.replace("Bearer ", "");
-        const sb = getSupabaseServer(token);
-        const { data: { user } } = await sb.auth.getUser();
-        if (user) return { id: user.id, token };
-    }
-    if (cookieHeader) {
-        const cookies = Object.fromEntries(
-            cookieHeader.split(";").map(c => { const [k, ...v] = c.trim().split("="); return [k, v.join("=")]; })
-        );
-        for (const [key, value] of Object.entries(cookies)) {
-            if (key.includes("auth-token") || key.includes("access-token")) {
-                try {
-                    const parsed = JSON.parse(decodeURIComponent(value));
-                    const token = parsed?.access_token || (Array.isArray(parsed) ? parsed[0]?.access_token : null);
-                    if (token) {
-                        const sb = getSupabaseServer(token);
-                        const { data: { user } } = await sb.auth.getUser();
-                        if (user) return { id: user.id, token };
-                    }
-                } catch { /* ignore */ }
-            }
-        }
-    }
-    return null;
-}
 
 function getUploadsDirLocal(): string {
     const DATA_DIR = path.join(process.cwd(), "data");
@@ -48,43 +17,60 @@ export async function DELETE(
     { params }: { params: Promise<{ storeId: string; docId: string }> }
 ) {
     try {
-        const user = await getUser(req);
+        const user = (await getAuthUser(req)) || (await getAuthUserFromCookie(req.headers.get("cookie")));
         if (!user) {
             return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
         }
 
         const { storeId, docId } = await params;
-        const ai = getGeminiClient();
-        const { documents: allDocs } = await getDocuments(user.id, storeId, user.token);
+        const token = user.accessToken;
+
+        // 1. Look up the document in Supabase
+        const { documents: allDocs } = await getDocuments(user.id, storeId, token);
         const docToDelete = allDocs.find(d => d.id === docId && d.storeId === storeId);
 
+        // 2. Delete from Gemini (if the document has a Gemini resource name)
         if (docToDelete && docToDelete.name) {
             try {
+                const ai = getGeminiClient();
                 await ai.fileSearchStores.documents.delete({ name: docToDelete.name });
             } catch (e: any) {
-                if (!e.message?.includes("404")) throw e;
+                // 404 = already gone from Gemini, that's fine
+                if (!e.message?.includes("404")) {
+                    console.error(`[DELETE doc] Gemini delete failed for ${docToDelete.name}:`, e.message);
+                }
             }
         }
 
+        // 3. Delete local file
         if (docToDelete?.localPath) {
             const localPath = path.join(getUploadsDirLocal(), docToDelete.localPath);
             if (fs.existsSync(localPath)) {
-                fs.unlinkSync(localPath);
+                try { fs.unlinkSync(localPath); } catch (e) {
+                    console.error(`[DELETE doc] Failed to delete local file: ${localPath}`, e);
+                }
             }
         }
 
-        await deleteDocumentDB(user.id, docId, user.token);
+        // 4. Delete from Supabase
+        await deleteDocumentDB(user.id, docId, token);
 
-        // Update store document count
-        const stores = await getStores(user.id, user.token);
-        const store = stores.find(s => s.id === storeId);
-        if (store) {
-            await upsertStore(user.id, { ...store, documentCount: Math.max(0, store.documentCount - 1) }, user.token);
+        // 5. Update store document count
+        try {
+            const stores = await getStores(user.id, token);
+            const store = stores.find(s => s.id === storeId);
+            if (store) {
+                await upsertStore(user.id, { ...store, documentCount: Math.max(0, store.documentCount - 1) }, token);
+            }
+        } catch (e) {
+            console.error("[DELETE doc] Failed to update store count:", e);
+            // Non-critical — document is already deleted
         }
 
         return NextResponse.json({ success: true });
     } catch (error: unknown) {
         const message = error instanceof Error ? error.message : "Unknown error";
+        console.error("[DELETE doc] Unhandled error:", message, error);
         return NextResponse.json({ error: message }, { status: 500 });
     }
 }
