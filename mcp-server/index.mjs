@@ -730,6 +730,9 @@ const handleSse = async (req, res) => {
 
         addMcpLog(`Assigned SessionId: ${sid}`);
 
+        // Create a fresh, isolated MCP Server instance for this session
+        const sessionServer = createSessionServer(sid);
+
         sessions.set(sid, {
             transport,
             server: sessionServer,
@@ -737,6 +740,9 @@ const handleSse = async (req, res) => {
             token: req.token,
             establishedAt: new Date().toISOString()
         });
+
+        // Wire the transport to the server so it can receive and respond to messages
+        await sessionServer.connect(transport);
 
         addMcpLog(`Session ${sid} established for user ${userId}`);
 
