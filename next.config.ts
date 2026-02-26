@@ -20,6 +20,10 @@ const nextConfig: NextConfig = {
                 source: "/mcp-status",
                 destination: "http://localhost:3001/",
             },
+            {
+                source: "/api/mcp-status",
+                destination: "http://localhost:3001/api/mcp-status",
+            },
         ];
     },
 };

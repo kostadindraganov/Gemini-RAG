@@ -25,36 +25,55 @@ if (!GEMINI_API_KEY) { console.error("[MCP] GEMINI_API_KEY not set"); process.ex
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-// ── Supabase helpers ──────────────────────────────────────────────────────────
+// ── Supabase helpers (safe) ──────────────────────────────────────────────────
 async function sbFetch(path, params = {}) {
-    const url = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
-    Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-    const res = await fetch(url.toString(), {
-        headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${SUPABASE_ANON}` }
-    });
-    return res.ok ? res.json() : null;
+    if (!SUPABASE_URL || !SUPABASE_ANON) return null;
+    try {
+        const url = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
+        Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+        const res = await fetch(url.toString(), {
+            headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${SUPABASE_ANON}` }
+        });
+        if (!res.ok) {
+            const err = await res.text();
+            throw new Error(`Supabase error: ${res.status} ${err}`);
+        }
+        return await res.json();
+    } catch (e) {
+        addMcpLog(`sbFetch error [${path}]: ${e.message}`);
+        return null;
+    }
 }
 
 async function sbPatch(path, filter, body) {
-    const url = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
-    Object.entries(filter).forEach(([k, v]) => url.searchParams.set(k, `eq.${v}`));
-    await fetch(url.toString(), {
-        method: "PATCH",
-        headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${SUPABASE_ANON}`, "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-    });
+    if (!SUPABASE_URL || !SUPABASE_ANON) return;
+    try {
+        const url = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
+        Object.entries(filter).forEach(([k, v]) => url.searchParams.set(k, `eq.${v}`));
+        await fetch(url.toString(), {
+            method: "PATCH",
+            headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${SUPABASE_ANON}`, "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+        });
+    } catch (e) {
+        addMcpLog(`sbPatch error [${path}]: ${e.message}`);
+    }
 }
 
 // ── Auth: validate key and resolve userId ─────────────────────────────────────
 async function resolveUser(bearerToken) {
-    if (!SUPABASE_URL || !SUPABASE_ANON) return { userId: null, valid: true }; // dev bypass
+    // If we have no DB config, allow everything with no userId for local dev
+    if (!SUPABASE_URL || !SUPABASE_ANON) {
+        return { userId: null, valid: true };
+    }
 
     const rows = await sbFetch("mcp_api_keys", {
         "key_value": `eq.${bearerToken}`,
         "is_active": "eq.true",
         "select": "id,user_id"
     });
-    if (!rows?.length) return { userId: null, valid: false };
+
+    if (!rows || rows.length === 0) return { userId: null, valid: false };
 
     const { id, user_id: userId } = rows[0];
     // fire-and-forget last_used update
@@ -151,36 +170,79 @@ const sessions = new Map();
 
 app.use((req, res, next) => {
     // Log incoming requests for debugging (excluding heartbeats/noisy logs if preferred)
-    if (req.url !== "/mcp-status" && req.url !== "/") {
-        console.log(`[MCP] ${req.method} ${req.url}`);
+    if (req.url !== "/mcp-status" && req.url !== "/" && !req.url.startsWith("/api/mcp-status")) {
+        addMcpLog(`${req.method} ${req.url}`);
     }
     next();
 });
 
 app.get("/", (req, res) => res.send("Gemini RAG MCP Server is alive."));
 
-
-// ── Auth middleware ───────────────────────────────────────────────────────────
-const auth = async (req, res, next) => {
-    let token = "";
-    const header = req.headers.authorization;
-    if (header?.startsWith("Bearer ")) {
-        token = header.slice(7);
-    } else if (req.query.token) {
-        token = req.query.token;
-    }
-
-    if (!token) {
-        return res.status(401).json({ error: "Missing token. Use Bearer header or ?token= query param." });
-    }
-
-    const { userId, valid } = await resolveUser(token);
-    if (!valid) {
-        return res.status(403).json({ error: "Invalid or inactive MCP API key." });
-    }
-    req.userId = userId;
-    next();
+// ── Status & Monitoring ───────────────────────────────────────────────────────
+// Simple in-memory log buffer for the UI
+const MAX_LOGS = 50;
+const mcpLogs = [];
+const addMcpLog = (msg) => {
+    const log = { id: Date.now() + Math.random(), time: new Date().toISOString(), message: msg };
+    mcpLogs.push(log);
+    if (mcpLogs.length > MAX_LOGS) mcpLogs.shift();
+    console.log(`[MCP] ${msg}`);
 };
+
+app.get("/api/mcp-status", (req, res) => {
+    // This is called via Next.js proxy, so we might need auth if exposed publicly,
+    // but for now it's internal to the server.
+    const activeSessions = Array.from(sessions.entries()).map(([sid, session]) => ({
+        sessionId: sid,
+        userId: session.userId,
+        established: session.establishedAt,
+    }));
+
+    res.json({
+        status: "online",
+        version: "2.1.0",
+        sessions: activeSessions,
+        logs: mcpLogs
+    });
+});
+
+
+// ── Auth middleware (safe) ───────────────────────────────────────────────────
+const auth = async (req, res, next) => {
+    try {
+        let token = "";
+        const header = req.headers.authorization;
+        if (header?.startsWith("Bearer ")) {
+            token = header.slice(7);
+        } else if (req.query.token) {
+            token = req.query.token;
+        }
+
+        if (!token) {
+            addMcpLog(`${req.method} ${req.url} - 401: Unauthorized (No token)`);
+            return res.status(401).json({ error: "Missing token. Use Bearer header or ?token= query param." });
+        }
+
+        const { userId, valid } = await resolveUser(token);
+        if (!valid) {
+            addMcpLog(`${req.method} ${req.url} - 403: Forbidden (Invalid key)`);
+            return res.status(403).json({ error: "Invalid or inactive MCP API key." });
+        }
+
+        req.userId = userId;
+        next();
+    } catch (e) {
+        addMcpLog(`Auth error: ${e.message}`);
+        res.status(500).json({ error: "Internal server error during authentication" });
+    }
+};
+
+// ── Helper: resolve userId from extra (transport session) ───────────────────
+function resolveUserIdFromExtra(extra) {
+    const sessionId = extra?.transport?.sessionId;
+    if (!sessionId) return null;
+    return sessions.get(sessionId)?.userId;
+}
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 const server = new McpServer({ name: "gemini-rag", version: "2.1.0" });
@@ -197,7 +259,7 @@ server.tool(
         model: z.string().optional().describe("Gemini model (default: gemini-2.5-flash)"),
     },
     async ({ message, storeId, model }, extra) => {
-        const userId = extra?.authInfo?.userId;
+        const userId = resolveUserIdFromExtra(extra);
         if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
 
         try {
@@ -235,7 +297,7 @@ server.tool(
         model: z.string().optional().describe("Gemini model"),
     },
     async ({ message, storeId, model }, extra) => {
-        const userId = extra?.authInfo?.userId;
+        const userId = resolveUserIdFromExtra(extra);
         if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
 
         try {
@@ -269,7 +331,7 @@ server.tool(
         model: z.string().optional().describe("Gemini model"),
     },
     async ({ message, model }, extra) => {
-        const userId = extra?.authInfo?.userId;
+        const userId = resolveUserIdFromExtra(extra);
         if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
 
         try {
@@ -299,7 +361,7 @@ server.tool(
     "List all available document stores with their IDs and names.",
     {},
     async (_, extra) => {
-        const userId = extra?.authInfo?.userId;
+        const userId = resolveUserIdFromExtra(extra);
         if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
 
         try {
@@ -327,7 +389,7 @@ server.tool(
     "Returns the currently active document store.",
     {},
     async (_, extra) => {
-        const userId = extra?.authInfo?.userId;
+        const userId = resolveUserIdFromExtra(extra);
         if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
 
         try {
@@ -355,7 +417,7 @@ server.tool(
     "Set the active document store.",
     { storeId: z.string().describe("Store ID or display name") },
     async ({ storeId }, extra) => {
-        const userId = extra?.authInfo?.userId;
+        const userId = resolveUserIdFromExtra(extra);
         if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
 
         try {
@@ -381,7 +443,7 @@ server.tool(
         limit: z.number().optional().describe("Max results (default 50)"),
     },
     async ({ storeId, limit }, extra) => {
-        const userId = extra?.authInfo?.userId;
+        const userId = resolveUserIdFromExtra(extra);
         if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
 
         try {
@@ -413,7 +475,7 @@ server.tool(
         model: z.string().optional().describe("Gemini model"),
     },
     async ({ storeId, focus, model }, extra) => {
-        const userId = extra?.authInfo?.userId;
+        const userId = resolveUserIdFromExtra(extra);
         if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
 
         try {
@@ -447,7 +509,7 @@ server.tool(
         storeId: z.string().optional().describe("Store ID"),
     },
     async ({ documentId, storeId }, extra) => {
-        const userId = extra?.authInfo?.userId;
+        const userId = resolveUserIdFromExtra(extra);
         if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
 
         try {
@@ -476,37 +538,45 @@ server.tool("help", "Show help.", {}, async () => ({
 // ── SSE transport handling (Session-aware) ────────────────────────────────────
 
 const handleSse = async (req, res) => {
-    const userId = req.userId;
-    const endpoint = req.path; // e.g. /sse or /mcp
+    try {
+        const userId = req.userId;
+        const endpoint = req.path;
 
-    // Proactive headers to combat proxy buffering/timeouts
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
+        addMcpLog(`Starting handshaking for user: ${userId} at ${endpoint}`);
 
-    const transport = new SSEServerTransport(endpoint, res);
-    await server.connect(transport);
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
 
-    const sid = transport.sessionId;
-    sessions.set(sid, { transport, userId });
+        // Note: SSEServerTransport might send headers immediately.
+        const transport = new SSEServerTransport(endpoint, res);
+        await server.connect(transport);
 
-    console.log(`[MCP] Session ${sid} established for user ${userId} at ${endpoint}`);
+        const sid = transport.sessionId;
+        sessions.set(sid, { transport, userId, establishedAt: new Date().toISOString() });
 
-    // 15s Heartbeat to keep the connection alive through Nginx/Traefik
-    const heartbeat = setInterval(() => {
-        if (!res.writableEnded) {
-            res.write(': heartbeat\n\n');
-        } else {
+        addMcpLog(`Session ${sid} established for user ${userId}`);
+
+        const heartbeat = setInterval(() => {
+            if (!res.writableEnded) {
+                res.write(': heartbeat\n\n');
+            } else {
+                clearInterval(heartbeat);
+            }
+        }, 15000);
+
+        transport.onclose = () => {
+            addMcpLog(`Session ${sid} closed`);
             clearInterval(heartbeat);
+            sessions.delete(sid);
+        };
+    } catch (e) {
+        addMcpLog(`SSE Error: ${e.message}`);
+        if (!res.headersSent) {
+            res.status(500).send(`SSE Connection failed: ${e.message}`);
         }
-    }, 15000);
-
-    transport.onclose = () => {
-        console.log(`[MCP] Session ${sid} closed`);
-        clearInterval(heartbeat);
-        sessions.delete(sid);
-    };
+    }
 };
 
 const handlePost = async (req, res) => {

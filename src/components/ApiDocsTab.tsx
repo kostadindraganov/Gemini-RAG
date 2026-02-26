@@ -125,10 +125,21 @@ export default function ApiDocsTab() {
     const [mcpApiKey, setMcpApiKey] = useState("");
     const [selectedEndpointId, setSelectedEndpointId] = useState<string>("localhost");
     const [endpointsLoaded, setEndpointsLoaded] = useState(false);
+    const [mcpStatus, setMcpStatus] = useState<{ sessions: any[], logs: any[] }>({ sessions: [], logs: [] });
 
     // Fetch endpoints + first MCP API key on mount
     useEffect(() => {
-        (async () => {
+        const fetchStatus = async () => {
+            try {
+                const res = await fetch("/api/mcp-status");
+                if (res.ok) {
+                    const data = await res.json();
+                    setMcpStatus(data);
+                }
+            } catch { /* ignore */ }
+        };
+
+        const fetchEndpointsAndKeys = async () => {
             try {
                 const { data: { session } } = await supabase.auth.getSession();
                 const token = session?.access_token;
@@ -142,7 +153,6 @@ export default function ApiDocsTab() {
                 if (epRes.ok) {
                     const { endpoints: eps } = await epRes.json();
                     setEndpoints(eps || []);
-                    // Pre-select the active endpoint if present
                     const active = (eps || []).find((e: McpEndpoint) => e.isActive);
                     if (active) setSelectedEndpointId(active.id);
                 }
@@ -154,7 +164,12 @@ export default function ApiDocsTab() {
             } catch { /* non-critical */ } finally {
                 setEndpointsLoaded(true);
             }
-        })();
+        };
+
+        fetchStatus();
+        fetchEndpointsAndKeys();
+        const interval = setInterval(fetchStatus, 5000);
+        return () => clearInterval(interval);
     }, []);
 
     const handleCopy = (text: string, id: string) => {
@@ -309,6 +324,68 @@ export default function ApiDocsTab() {
                             <span style={{ color: "var(--text-secondary)", fontSize: "0.82rem", lineHeight: 1.4 }}>{t.desc}</span>
                         </div>
                     ))}
+                </div>
+            </div>
+
+            {/* ── MCP Server Status & Logs ─────────────────────────────────── */}
+            <div style={{ marginTop: "3rem", paddingTop: "2rem", borderTop: "1px solid var(--border-color)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", marginBottom: "1.25rem" }}>
+                    <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#22c55e", boxShadow: "0 0 8px #22c55e" }} />
+                    <h4 style={{ margin: 0 }}>Server Monitoring</h4>
+                    <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", marginLeft: "auto" }}>Live updates every 5s</span>
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "1.5rem" }}>
+                    {/* Active Sessions */}
+                    <div style={{ background: "rgba(0,0,0,0.15)", borderRadius: "12px", border: "1px solid var(--border-color)", overflow: "hidden" }}>
+                        <div style={{ padding: "0.75rem 1rem", borderBottom: "1px solid var(--border-color)", background: "rgba(255,255,255,0.03)", fontSize: "0.8rem", fontWeight: 600, display: "flex", justifyContent: "space-between" }}>
+                            <span>Active Client Sessions</span>
+                            <span style={{ color: "var(--accent-1)" }}>{mcpStatus.sessions.length}</span>
+                        </div>
+                        <div style={{ maxHeight: "250px", overflowY: "auto", padding: "0.5rem" }}>
+                            {mcpStatus.sessions.length === 0 ? (
+                                <div style={{ padding: "2rem 1rem", textAlign: "center", color: "var(--text-muted)", fontSize: "0.8rem" }}>
+                                    No active clients connected.
+                                </div>
+                            ) : (
+                                mcpStatus.sessions.map((s, idx) => (
+                                    <div key={idx} style={{ padding: "0.6rem 0.75rem", borderRadius: "8px", background: "rgba(255,255,255,0.02)", marginBottom: "0.4rem", border: "1px solid rgba(255,255,255,0.05)" }}>
+                                        <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", marginBottom: "0.2rem", display: "flex", justifyContent: "space-between" }}>
+                                            <span>Session ID:</span>
+                                            <span style={{ fontFamily: "monospace", color: "var(--text-secondary)" }}>{s.sessionId.slice(0, 8)}...</span>
+                                        </div>
+                                        <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", display: "flex", justifyContent: "space-between" }}>
+                                            <span>Connected:</span>
+                                            <span style={{ color: "var(--text-secondary)" }}>{new Date(s.established).toLocaleTimeString()}</span>
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Server Logs */}
+                    <div style={{ background: "rgba(0,0,0,0.15)", borderRadius: "12px", border: "1px solid var(--border-color)", overflow: "hidden" }}>
+                        <div style={{ padding: "0.75rem 1rem", borderBottom: "1px solid var(--border-color)", background: "rgba(255,255,255,0.03)", fontSize: "0.8rem", fontWeight: 600 }}>
+                            Recent Server Activity
+                        </div>
+                        <div style={{ maxHeight: "250px", overflowY: "auto", padding: "0.5rem", fontFamily: "monospace", fontSize: "0.75rem" }}>
+                            {mcpStatus.logs.length === 0 ? (
+                                <div style={{ padding: "2rem 1rem", textAlign: "center", color: "var(--text-muted)" }}>
+                                    Waiting for activity...
+                                </div>
+                            ) : (
+                                [...mcpStatus.logs].reverse().map((log) => (
+                                    <div key={log.id} style={{ padding: "0.35rem 0.5rem", borderBottom: "1px solid rgba(255,255,255,0.03)", color: "#a8b1c2", display: "flex", gap: "0.75rem" }}>
+                                        <span style={{ color: "var(--text-muted)", flexShrink: 0 }}>[{new Date(log.time).toLocaleTimeString()}]</span>
+                                        <span style={{ color: log.message.includes("POST") ? "var(--accent-2)" : log.message.includes("establish") ? "var(--accent-1)" : "inherit" }}>
+                                            {log.message}
+                                        </span>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
