@@ -1,8 +1,10 @@
 import express from "express";
 import cors from "cors";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
 import { GoogleGenAI } from "@google/genai";
 import * as fs from "fs";
 
@@ -244,13 +246,21 @@ function resolveUserIdFromExtra(extra) {
     return sessions.get(sessionId)?.userId;
 }
 
-// ── MCP Server ────────────────────────────────────────────────────────────────
-const server = new McpServer({ name: "gemini-rag", version: "2.1.0" });
+// ── MCP Server Logic (Reusable) ───────────────────────────────────────────────
+
+const serverInfo = { name: "gemini-rag", version: "2.1.0" };
+
+// We define tools in a registry so we can attach them to multiple server instances
+// (needed because McpServer/Server instances are 1:1 with transports)
+const tools = [];
+function registerTool(name, description, schema, handler) {
+    tools.push({ name, description, schema, handler });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. chat  ▸ The primary tool
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool(
+registerTool(
     "chat",
     "Chat with your documents. Asks a question and gets an answer grounded in your uploaded files.",
     {
@@ -288,7 +298,7 @@ server.tool(
 // ─────────────────────────────────────────────────────────────────────────────
 // 2. chat_with_store
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool(
+registerTool(
     "chat_with_store",
     "Chat with documents in a specific store by its ID or display name.",
     {
@@ -323,7 +333,7 @@ server.tool(
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. chat_all_stores
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool(
+registerTool(
     "chat_all_stores",
     "Ask a question and search across ALL of your document stores simultaneously.",
     {
@@ -356,7 +366,7 @@ server.tool(
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. list_stores
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool(
+registerTool(
     "list_stores",
     "List all available document stores with their IDs and names.",
     {},
@@ -384,7 +394,7 @@ server.tool(
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. get_active_store
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool(
+registerTool(
     "get_active_store",
     "Returns the currently active document store.",
     {},
@@ -412,7 +422,7 @@ server.tool(
 // ─────────────────────────────────────────────────────────────────────────────
 // 6. set_active_store
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool(
+registerTool(
     "set_active_store",
     "Set the active document store.",
     { storeId: z.string().describe("Store ID or display name") },
@@ -435,7 +445,7 @@ server.tool(
 // ─────────────────────────────────────────────────────────────────────────────
 // 7. list_documents
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool(
+registerTool(
     "list_documents",
     "List the documents/files uploaded to a store.",
     {
@@ -466,7 +476,7 @@ server.tool(
 // ─────────────────────────────────────────────────────────────────────────────
 // 8. summarize
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool(
+registerTool(
     "summarize",
     "Generate a summary of all documents in a store.",
     {
@@ -501,7 +511,7 @@ server.tool(
 // ─────────────────────────────────────────────────────────────────────────────
 // 9. delete_document
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool(
+registerTool(
     "delete_document",
     "Permanently delete a document from a store.",
     {
@@ -531,9 +541,53 @@ server.tool(
 // ─────────────────────────────────────────────────────────────────────────────
 // 10. help
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool("help", "Show help.", {}, async () => ({
+registerTool("help", "Show help.", {}, async () => ({
     content: [{ type: "text", text: `Gemini RAG MCP v2.1\nUse chat, list_stores, etc.` }]
 }));
+
+/**
+ * Creates a fresh, independent Server instance for a new transport session.
+ * Using the low-level Server class ensures no shared state between sessions.
+ */
+function createSessionServer(sessionId) {
+    const s = new Server(
+        { name: "gemini-rag", version: "2.1.0" },
+        { capabilities: { tools: {} } }
+    );
+
+    // Register List Tools handler
+    s.setRequestHandler(ListToolsRequestSchema, async () => {
+        addMcpLog(`[Session ${sessionId}] Client requested tool list`);
+        return {
+            tools: tools.map(t => ({
+                name: t.name,
+                description: t.description,
+                inputSchema: zodToJsonSchema(t.schema)
+            }))
+        };
+    });
+
+    // Register Call Tool handler
+    s.setRequestHandler(CallToolRequestSchema, async (request) => {
+        const tool = tools.find(t => t.name === request.params.name);
+        if (!tool) throw new Error(`Tool not found: ${request.params.name}`);
+
+        addMcpLog(`[Session ${sessionId}] Calling tool: ${request.params.name}`);
+
+        try {
+            // Manually parse arguments using the Zod schema
+            const args = tool.schema.parse(request.params.arguments || {});
+            return await tool.handler(args, { transport: { sessionId } });
+        } catch (e) {
+            addMcpLog(`[Session ${sessionId}] Tool execution failed: ${e.message}`);
+            throw e; // MCP SDK will wrap this in a JSON-RPC error
+        }
+    });
+
+    s.onerror = (error) => addMcpLog(`[Session ${sessionId}] Server Error: ${error.message}`);
+
+    return s;
+}
 
 // ── SSE transport handling (Session-aware) ────────────────────────────────────
 
@@ -549,12 +603,17 @@ const handleSse = async (req, res) => {
         res.setHeader('Connection', 'keep-alive');
         res.setHeader('X-Accel-Buffering', 'no');
 
-        // Note: SSEServerTransport might send headers immediately.
+        // Create transport - endpoint is the path where the client will POST messages
         const transport = new SSEServerTransport(endpoint, res);
-        await server.connect(transport);
-
         const sid = transport.sessionId;
-        sessions.set(sid, { transport, userId, establishedAt: new Date().toISOString() });
+
+        addMcpLog(`Assigned SessionId: ${sid}`);
+
+        // CREATE A NEW SERVER INSTANCE FOR THIS TRANSPORT
+        const sessionServer = createSessionServer(sid);
+        await sessionServer.connect(transport);
+
+        sessions.set(sid, { transport, server: sessionServer, userId, establishedAt: new Date().toISOString() });
 
         addMcpLog(`Session ${sid} established for user ${userId}`);
 
