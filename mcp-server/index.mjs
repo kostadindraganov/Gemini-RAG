@@ -145,6 +145,7 @@ async function ragQuery({ query, storeNames, model = "gemini-2.5-flash", systemP
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
+app.get("/", (req, res) => res.send("Gemini RAG MCP Server is alive."));
 
 // Per-connection userId store (connection → userId)
 const connectionUsers = new Map(); // transportId → userId
