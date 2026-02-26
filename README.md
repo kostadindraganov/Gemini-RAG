@@ -30,12 +30,15 @@ Beyond a simple chat interface, it includes a built-in **MCP (Model Context Prot
 
 ## 🛠 Tech Stack
 
-- **Framework**: [Next.js 14+](https://nextjs.org/) (App Router)
+- **Framework**: [Next.js 15](https://nextjs.org/) (App Router)
 - **Language**: TypeScript
-- **Backend/Auth/DB**: [Supabase](https://supabase.com/)
-- **AI Engine**: [Google Gemini SDK](https://ai.google.dev/)
-- **Protocol**: [MCP (Model Context Protocol)](https://modelcontextprotocol.io/)
-- **Styling**: Vanilla CSS (Custom Variable System)
+- **Frontend**: [React 19](https://react.dev/)
+- **Backend/Auth/DB**: [Supabase](https://supabase.com/) (using `@supabase/ssr`)
+- **AI Engine**: [Google Generative AI SDK](https://www.npmjs.com/package/@google/genai) (Gemini 1.5, 2.0, 2.5, and 3.1 Pro support)
+- **Protocol**: [MCP SDK](https://modelcontextprotocol.io/) (`@modelcontextprotocol/sdk`)
+- **External Server**: [Express 5](https://expressjs.com/) (providing SSE transport for MCP)
+- **Styling**: Vanilla CSS (Premium Design System)
+- **Content**: `react-markdown` with `remark-gfm`
 
 ---
 
