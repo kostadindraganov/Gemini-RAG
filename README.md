@@ -47,7 +47,7 @@ Beyond a simple chat interface, it includes a built-in **MCP (Model Context Prot
 ## 🚀 Getting Started
 
 ### 1. Prerequisites
-- Node.js 18.x or higher
+- Node.js 22.x or higher
 - A Supabase Project
 - A Google AI Studio API Key
 
