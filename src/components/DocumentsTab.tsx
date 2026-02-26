@@ -203,7 +203,7 @@ export default function DocumentsTab({ activeStoreId, accessToken }: { activeSto
                                             <td>
                                                 <div style={{ display: "flex", gap: "0.5rem" }}>
                                                     <a
-                                                        href={`/api/stores/${activeStoreId}/documents/${doc.id}/download`}
+                                                        href={`/api/stores/${activeStoreId}/documents/${doc.id}/download?token=${accessToken}`}
                                                         target="_blank"
                                                         className="btn-secondary"
                                                         style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }}

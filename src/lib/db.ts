@@ -73,6 +73,29 @@ export async function getDocuments(userId: string, storeId?: string, accessToken
     };
 }
 
+export async function getDocument(userId: string, docId: string, accessToken?: string): Promise<DocumentRecord | null> {
+    const sb = getSupabaseServer(accessToken);
+    const { data, error } = await sb
+        .from("documents")
+        .select("*")
+        .eq("user_id", userId)
+        .eq("id", docId)
+        .single();
+    if (error) return null;
+    return {
+        id: data.id,
+        storeId: data.store_id,
+        name: data.name,
+        displayName: data.display_name,
+        originalFilename: data.original_filename,
+        mimeType: data.mime_type,
+        size: data.size,
+        uploadedAt: data.uploaded_at,
+        localPath: data.local_path,
+        metadata: data.metadata,
+    };
+}
+
 export async function insertDocument(userId: string, doc: DocumentRecord, accessToken?: string) {
     const sb = getSupabaseServer(accessToken);
     const { error } = await sb.from("documents").insert({
@@ -392,8 +415,18 @@ export async function getUserCount(): Promise<number> {
 
 export async function getAuthUser(req: Request) {
     const authHeader = req.headers.get("authorization");
-    if (!authHeader) return null;
-    const token = authHeader.replace("Bearer ", "");
+    let token = "";
+
+    if (authHeader?.startsWith("Bearer ")) {
+        token = authHeader.replace("Bearer ", "");
+    } else {
+        // Check query params
+        const url = new URL(req.url);
+        token = url.searchParams.get("token") || "";
+    }
+
+    if (!token) return null;
+
     const sb = getSupabaseServer(token);
     const { data: { user }, error } = await sb.auth.getUser();
     if (error || !user) return null;
@@ -404,7 +437,7 @@ export async function getAuthUser(req: Request) {
 export async function getAuthUserFromCookie(cookieHeader: string | null) {
     if (!cookieHeader) return null;
     const sb = getSupabaseServer();
-    // Parse sb-access-token from cookies
+
     const cookies = Object.fromEntries(
         cookieHeader.split(";").map(c => {
             const [k, ...v] = c.trim().split("=");
@@ -412,8 +445,17 @@ export async function getAuthUserFromCookie(cookieHeader: string | null) {
         })
     );
 
-    const accessToken = cookies["sb-access-token"] || cookies["sb-isyujkwwknavsehnbsdc-auth-token"];
-    if (!accessToken) return null;
+    // Parse any cookie matching sb-[ref]-auth-token
+    const authCookieName = Object.keys(cookies).find(name =>
+        name === "sb-access-token" || (name.startsWith("sb-") && name.endsWith("-auth-token"))
+    );
+
+    const accessToken = authCookieName ? cookies[authCookieName] : null;
+
+    if (!accessToken) {
+        console.warn("Auth: No Supabase auth cookie found in request headers");
+        return null;
+    }
 
     try {
         const parsed = JSON.parse(decodeURIComponent(accessToken));

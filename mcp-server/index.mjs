@@ -271,6 +271,7 @@ const auth = async (req, res, next) => {
         }
 
         req.userId = userId;
+        req.token = token;
         next();
     } catch (e) {
         addMcpLog(`Auth error: ${e.message}`);
@@ -278,11 +279,15 @@ const auth = async (req, res, next) => {
     }
 };
 
-// ── Helper: resolve userId from extra (transport session) ───────────────────
-function resolveUserIdFromExtra(extra) {
+// ── Helper: resolve session from extra (transport session) ───────────────────
+function resolveSessionFromExtra(extra) {
     const sessionId = extra?.transport?.sessionId;
     if (!sessionId) return null;
-    return sessions.get(sessionId)?.userId;
+    return sessions.get(sessionId);
+}
+
+function resolveUserIdFromExtra(extra) {
+    return resolveSessionFromExtra(extra)?.userId;
 }
 
 // ── MCP Server Logic (Reusable) ───────────────────────────────────────────────
@@ -588,8 +593,10 @@ registerTool(
         storeId: z.string().optional().describe("Store ID or name. Uses active store if omitted."),
     },
     async ({ documentId, storeId }, extra) => {
-        const userId = resolveUserIdFromExtra(extra);
-        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        const session = resolveSessionFromExtra(extra);
+        if (!session?.userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        const userId = session.userId;
+        const sessionToken = session.token;
 
         try {
             const settings = await getUserSettings(userId);
@@ -626,7 +633,7 @@ registerTool(
 
             const cleanDocId = doc.id;
             const viewUrl = `${APP_URL}/?tab=docs&storeId=${activeStoreId}&docId=${cleanDocId}`;
-            const downloadUrl = `${APP_URL}/api/stores/${activeStoreId}/documents/${cleanDocId}/download`;
+            const downloadUrl = `${APP_URL}/api/stores/${activeStoreId}/documents/${cleanDocId}/download?token=${sessionToken}`;
 
             return {
                 content: [{
@@ -723,11 +730,13 @@ const handleSse = async (req, res) => {
 
         addMcpLog(`Assigned SessionId: ${sid}`);
 
-        // CREATE A NEW SERVER INSTANCE FOR THIS TRANSPORT
-        const sessionServer = createSessionServer(sid);
-        await sessionServer.connect(transport);
-
-        sessions.set(sid, { transport, server: sessionServer, userId, establishedAt: new Date().toISOString() });
+        sessions.set(sid, {
+            transport,
+            server: sessionServer,
+            userId,
+            token: req.token,
+            establishedAt: new Date().toISOString()
+        });
 
         addMcpLog(`Session ${sid} established for user ${userId}`);
 
