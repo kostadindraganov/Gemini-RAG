@@ -2,6 +2,7 @@ import { createClient } from "@supabase/supabase-js";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
 // Browser client (for components)
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
@@ -16,4 +17,16 @@ export function getSupabaseServer(accessToken?: string) {
         });
     }
     return createClient(supabaseUrl, supabaseAnonKey);
+}
+
+/**
+ * Admin client using service role key — bypasses RLS entirely.
+ * Use ONLY on the server side, ONLY when the caller has already verified
+ * the user's identity (e.g., via MCP API key lookup).
+ */
+export function getSupabaseAdmin() {
+    const key = supabaseServiceKey || supabaseAnonKey;
+    return createClient(supabaseUrl, key, {
+        auth: { autoRefreshToken: false, persistSession: false },
+    });
 }

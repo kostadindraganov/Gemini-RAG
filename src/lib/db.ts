@@ -96,6 +96,31 @@ export async function getDocument(userId: string, docId: string, accessToken?: s
     };
 }
 
+/** Like getDocument, but uses the service role key to bypass RLS. */
+export async function getDocumentAdmin(userId: string, docId: string): Promise<DocumentRecord | null> {
+    const { getSupabaseAdmin } = await import("./supabase");
+    const sb = getSupabaseAdmin();
+    const { data, error } = await sb
+        .from("documents")
+        .select("*")
+        .eq("user_id", userId)
+        .eq("id", docId)
+        .single();
+    if (error) return null;
+    return {
+        id: data.id,
+        storeId: data.store_id,
+        name: data.name,
+        displayName: data.display_name,
+        originalFilename: data.original_filename,
+        mimeType: data.mime_type,
+        size: data.size,
+        uploadedAt: data.uploaded_at,
+        localPath: data.local_path,
+        metadata: data.metadata,
+    };
+}
+
 export async function insertDocument(userId: string, doc: DocumentRecord, accessToken?: string) {
     const sb = getSupabaseServer(accessToken);
     const { error } = await sb.from("documents").insert({

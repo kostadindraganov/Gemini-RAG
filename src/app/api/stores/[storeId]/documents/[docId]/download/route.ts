@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDocument } from "@/lib/db";
+import { getDocument, getDocumentAdmin } from "@/lib/db";
 import { getAuthUser, getAuthUserFromCookie } from "@/lib/db";
-import { getSupabaseServer } from "@/lib/supabase";
+import { getSupabaseAdmin } from "@/lib/supabase";
 import path from "path";
 import fs from "fs";
 
@@ -30,7 +30,7 @@ function getUploadsDirLocal(): string {
  */
 async function getUserFromMcpKey(token: string): Promise<{ id: string } | null> {
     if (!token) return null;
-    const sb = getSupabaseServer(); // uses anon key
+    const sb = getSupabaseAdmin(); // uses service role key to bypass RLS
     const { data, error } = await sb
         .from("mcp_api_keys")
         .select("user_id")
@@ -57,6 +57,7 @@ export async function GET(
         // 1. Try normal Supabase JWT auth (Bearer header or ?token= query param)
         let userId: string | null = null;
         let accessToken: string | undefined;
+        let useAdmin = false;
 
         const jwtUser = (await getAuthUser(req)) || (await getAuthUserFromCookie(req.headers.get("cookie")));
         if (jwtUser) {
@@ -75,9 +76,7 @@ export async function GET(
             const mcpUser = await getUserFromMcpKey(rawToken);
             if (mcpUser) {
                 userId = mcpUser.id;
-                // No Supabase access token available — getDocument will use the anon key,
-                // which is fine because the RLS user_id filter still scopes the query.
-                accessToken = undefined;
+                useAdmin = true; // No Supabase JWT — use admin client for document query
             }
         }
 
@@ -87,7 +86,10 @@ export async function GET(
 
         const { storeId, docId } = await params;
 
-        const doc = await getDocument(userId, docId, accessToken);
+        // Use admin client for MCP-key auth (bypasses RLS), JWT client otherwise
+        const doc = useAdmin
+            ? await getDocumentAdmin(userId, docId)
+            : await getDocument(userId, docId, accessToken);
 
         if (!doc) {
             return NextResponse.json({ error: "Document not found in database", docId, storeId }, { status: 404 });
