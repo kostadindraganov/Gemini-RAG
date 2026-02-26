@@ -126,12 +126,13 @@ export default function ApiDocsTab() {
     const [selectedEndpointId, setSelectedEndpointId] = useState<string>("localhost");
     const [endpointsLoaded, setEndpointsLoaded] = useState(false);
     const [mcpStatus, setMcpStatus] = useState<{ sessions: any[], history: any[], logs: any[] }>({ sessions: [], history: [], logs: [] });
+    const [authHeaders, setAuthHeaders] = useState<Record<string, string>>({});
 
     // Fetch endpoints + first MCP API key on mount
     useEffect(() => {
-        const fetchStatus = async () => {
+        const fetchStatus = async (headers: Record<string, string> = {}) => {
             try {
-                const res = await fetch("/api/mcp-status");
+                const res = await fetch("/api/mcp-status", { headers });
                 if (res.ok) {
                     const data = await res.json();
                     setMcpStatus(data);
@@ -139,15 +140,17 @@ export default function ApiDocsTab() {
             } catch { /* ignore */ }
         };
 
-        const fetchEndpointsAndKeys = async () => {
+        const fetchAll = async () => {
             try {
                 const { data: { session } } = await supabase.auth.getSession();
                 const token = session?.access_token;
                 const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+                setAuthHeaders(headers);
 
                 const [epRes, keyRes] = await Promise.all([
                     fetch("/api/mcp-endpoints", { headers }),
                     fetch("/api/mcp-keys", { headers }),
+                    fetchStatus(headers),
                 ]);
 
                 if (epRes.ok) {
@@ -166,9 +169,13 @@ export default function ApiDocsTab() {
             }
         };
 
-        fetchStatus();
-        fetchEndpointsAndKeys();
-        const interval = setInterval(fetchStatus, 5000);
+        fetchAll();
+        // Poll status every 5 s — authHeaders state may lag, so re-read session each time
+        const interval = setInterval(async () => {
+            const { data: { session } } = await supabase.auth.getSession();
+            const token = session?.access_token;
+            fetchStatus(token ? { Authorization: `Bearer ${token}` } : {});
+        }, 5000);
         return () => clearInterval(interval);
     }, []);
 
@@ -392,7 +399,7 @@ export default function ApiDocsTab() {
                             <button
                                 onClick={async () => {
                                     try {
-                                        await fetch("/api/mcp-logs/clear", { method: "POST" });
+                                        await fetch("/api/mcp-logs/clear", { method: "POST", headers: authHeaders });
                                         setMcpStatus(prev => ({ ...prev, logs: [] }));
                                     } catch { }
                                 }}

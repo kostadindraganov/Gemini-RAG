@@ -833,7 +833,7 @@ const handlePost = async (req, res) => {
     }
 
     try {
-        await session.transport.handlePostMessage(req, res);
+        await session.transport.handlePostMessage(req, res, req.body);
     } catch (e) {
         addMcpLog(`POST error [${sessionId}]: ${e.message}`);
         if (!res.writableEnded) res.status(500).json({ error: e.message });
