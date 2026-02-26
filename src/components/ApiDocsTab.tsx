@@ -125,7 +125,7 @@ export default function ApiDocsTab() {
     const [mcpApiKey, setMcpApiKey] = useState("");
     const [selectedEndpointId, setSelectedEndpointId] = useState<string>("localhost");
     const [endpointsLoaded, setEndpointsLoaded] = useState(false);
-    const [mcpStatus, setMcpStatus] = useState<{ sessions: any[], logs: any[] }>({ sessions: [], logs: [] });
+    const [mcpStatus, setMcpStatus] = useState<{ sessions: any[], history: any[], logs: any[] }>({ sessions: [], history: [], logs: [] });
 
     // Fetch endpoints + first MCP API key on mount
     useEffect(() => {
@@ -336,30 +336,47 @@ export default function ApiDocsTab() {
                 </div>
 
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "1.5rem" }}>
-                    {/* Active Sessions */}
+                    {/* Active & Recent Sessions */}
                     <div style={{ background: "rgba(0,0,0,0.15)", borderRadius: "12px", border: "1px solid var(--border-color)", overflow: "hidden" }}>
                         <div style={{ padding: "0.75rem 1rem", borderBottom: "1px solid var(--border-color)", background: "rgba(255,255,255,0.03)", fontSize: "0.8rem", fontWeight: 600, display: "flex", justifyContent: "space-between" }}>
-                            <span>Active Client Sessions</span>
-                            <span style={{ color: "var(--accent-1)" }}>{mcpStatus.sessions.length}</span>
+                            <span>Client Sessions</span>
+                            <span style={{ color: "var(--accent-1)" }}>{mcpStatus.sessions.length} Active</span>
                         </div>
                         <div style={{ maxHeight: "250px", overflowY: "auto", padding: "0.5rem" }}>
-                            {mcpStatus.sessions.length === 0 ? (
+                            {mcpStatus.sessions.length === 0 && (mcpStatus.history || []).length === 0 ? (
                                 <div style={{ padding: "2rem 1rem", textAlign: "center", color: "var(--text-muted)", fontSize: "0.8rem" }}>
-                                    No active clients connected.
+                                    No connection activity.
                                 </div>
                             ) : (
-                                mcpStatus.sessions.map((s, idx) => (
-                                    <div key={idx} style={{ padding: "0.6rem 0.75rem", borderRadius: "8px", background: "rgba(255,255,255,0.02)", marginBottom: "0.4rem", border: "1px solid rgba(255,255,255,0.05)" }}>
-                                        <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", marginBottom: "0.2rem", display: "flex", justifyContent: "space-between" }}>
-                                            <span>Session ID:</span>
-                                            <span style={{ fontFamily: "monospace", color: "var(--text-secondary)" }}>{s.sessionId?.slice(0, 8) || "unknown"}...</span>
+                                <>
+                                    {/* Active */}
+                                    {mcpStatus.sessions.map((s, idx) => (
+                                        <div key={`active-${idx}`} style={{ padding: "0.6rem 0.75rem", borderRadius: "8px", background: "rgba(34, 197, 94, 0.05)", marginBottom: "0.4rem", border: "1px solid rgba(34, 197, 94, 0.1)" }}>
+                                            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.3rem" }}>
+                                                <span style={{ fontSize: "0.65rem", fontWeight: 700, color: "#22c55e", textTransform: "uppercase" }}>Active</span>
+                                                <span style={{ fontSize: "0.65rem", color: "var(--text-muted)" }}>{s.established ? new Date(s.established).toLocaleTimeString() : ""}</span>
+                                            </div>
+                                            <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", display: "flex", justifyContent: "space-between" }}>
+                                                <span>Session:</span>
+                                                <span style={{ fontFamily: "monospace", color: "var(--text-secondary)" }}>{s.sessionId?.slice(0, 8)}...</span>
+                                            </div>
                                         </div>
-                                        <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", display: "flex", justifyContent: "space-between" }}>
-                                            <span>Connected:</span>
-                                            <span style={{ color: "var(--text-secondary)" }}>{s.established ? new Date(s.established).toLocaleTimeString() : "unknown"}</span>
+                                    ))}
+
+                                    {/* History */}
+                                    {(mcpStatus.history || []).map((s, idx) => (
+                                        <div key={`hist-${idx}`} style={{ padding: "0.6rem 0.75rem", borderRadius: "8px", background: "rgba(255,255,255,0.02)", marginBottom: "0.4rem", border: "1px solid rgba(255,255,255,0.05)", opacity: 0.7 }}>
+                                            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.3rem" }}>
+                                                <span style={{ fontSize: "0.65rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>Closed</span>
+                                                <span style={{ fontSize: "0.65rem", color: "var(--text-muted)" }}>{s.closedAt ? new Date(s.closedAt).toLocaleTimeString() : ""}</span>
+                                            </div>
+                                            <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", display: "flex", justifyContent: "space-between" }}>
+                                                <span>Session:</span>
+                                                <span style={{ fontFamily: "monospace", color: "var(--text-secondary)" }}>{s.sessionId?.slice(0, 8)}...</span>
+                                            </div>
                                         </div>
-                                    </div>
-                                ))
+                                    ))}
+                                </>
                             )}
                         </div>
                     </div>

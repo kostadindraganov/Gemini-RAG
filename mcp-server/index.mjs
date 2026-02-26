@@ -184,6 +184,8 @@ app.use(cors());
 
 // Internal session Map: sessionId -> { transport, userId }
 const sessions = new Map();
+const sessionHistory = [];
+const MAX_SESSION_HISTORY = 10;
 
 app.use((req, res, next) => {
     // Log incoming requests for debugging (excluding heartbeats/noisy logs if preferred)
@@ -219,6 +221,7 @@ app.get("/api/mcp-status", (req, res) => {
         status: "online",
         version: "2.1.0",
         sessions: activeSessions,
+        history: sessionHistory,
         logs: mcpLogs
     });
 });
@@ -564,10 +567,10 @@ registerTool(
 // ─────────────────────────────────────────────────────────────────────────────
 registerTool(
     "get_document_link",
-    "Generates a link to view a document in the web interface.",
+    "Generates links to view or download a document.",
     {
-        documentId: z.string().describe("Document ID"),
-        storeId: z.string().optional().describe("Store ID"),
+        documentId: z.string().describe("Document ID (e.g. documents/123)"),
+        storeId: z.string().optional().describe("Store ID. Uses active store if omitted."),
     },
     async ({ documentId, storeId }, extra) => {
         const userId = resolveUserIdFromExtra(extra);
@@ -578,12 +581,16 @@ registerTool(
             const resolvedId = storeId || settings?.active_store_id;
             if (!resolvedId) return { content: [{ type: "text", text: "Store ID required." }] };
 
-            // Construct link to the docs tab
-            const url = `${APP_URL}/?tab=docs&storeId=${resolvedId}&docId=${documentId}`;
+            // Strip prefix if present (e.g. "documents/123" -> "123")
+            const cleanDocId = documentId.split("/").pop();
+
+            const viewUrl = `${APP_URL}/?tab=docs&storeId=${resolvedId}&docId=${cleanDocId}`;
+            const downloadUrl = `${APP_URL}/api/stores/${resolvedId}/documents/${cleanDocId}/download`;
+
             return {
                 content: [{
                     type: "text",
-                    text: `View document here: ${url}`
+                    text: `View: ${viewUrl}\nDownload: ${downloadUrl}`
                 }]
             };
         } catch (e) {
@@ -692,6 +699,18 @@ const handleSse = async (req, res) => {
         }, 15000);
 
         transport.onclose = () => {
+            const session = sessions.get(sid);
+            if (session) {
+                // Add to history before deleting
+                sessionHistory.unshift({
+                    sessionId: sid,
+                    userId: session.userId,
+                    established: session.establishedAt,
+                    closedAt: new Date().toISOString()
+                });
+                if (sessionHistory.length > MAX_SESSION_HISTORY) sessionHistory.pop();
+            }
+
             addMcpLog(`Session ${sid} closed`);
             clearInterval(heartbeat);
             sessions.delete(sid);
