@@ -22,6 +22,8 @@ Beyond a simple chat interface, it includes a built-in **MCP (Model Context Prot
 
 ### 🎨 Premium UI/UX
 - **Cinematic Dark Mode**: A high-contrast OLED-optimized interface with glass-morphic panels.
+- **Global Administration**: Dedicated system-wide settings for platform owners.
+- **Registration Lock**: Ability to close public signups once a primary user is registered, protected by a database-level trigger.
 - **Responsive Header**: Real-time display of Google AI Account Tier (Free/Pro), token usage, and active model.
 - **Live Markdown Support**: Rich text rendering with syntax highlighting, tables, and auto-generated citations.
 - **Fully Responsive**: Optimized for Desktop, Tablet, and Mobile workflows.
@@ -58,12 +60,19 @@ NEXT_PUBLIC_SUPABASE_URL=your_supabase_project_url
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
 ```
 
-### 3. Installation
+### 3. Database Setup (Supabase)
+Navigate to the `supabase/` directory and execute the following SQL scripts in your Supabase SQL Editor in order:
+1. `migration.sql` (Core Schema)
+2. `supabase-account-tier.sql` (Tier Detection)
+3. `supabase-mcp-endpoints.sql` (MCP Overrides)
+4. `supabase-registration-lock.sql` (Global Admin Features)
+
+### 4. Installation
 ```bash
 npm install
 ```
 
-### 4. Running the App
+### 5. Running the App
 ```bash
 npm run dev
 ```
