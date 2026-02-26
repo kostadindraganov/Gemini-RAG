@@ -69,10 +69,20 @@ export async function POST(
         // Save to local fs
         const uploadsDir = getUploadsDirLocal();
         const id = uuidv4();
-        const localFilename = `${id}_${file.name}`;
+        // Use an ASCII-only local filename because the Gemini SDK uses the 
+        // local file basename to set HTTP headers, which crash on non-ASCII characters.
+        const localFilename = `${id}${path.extname(file.name)}`;
         const localPath = path.join(uploadsDir, localFilename);
         const buffer = Buffer.from(await file.arrayBuffer());
         fs.writeFileSync(localPath, buffer);
+
+        // Gemini API only accepts ASCII (Latin-1) in displayName.
+        // Encode non-ASCII filenames (e.g. Cyrillic, Chinese) via encodeURIComponent
+        // so every character is within the 0-127 range. The original name is
+        // preserved in our DB record (displayName / originalFilename fields).
+        const safeDisplayName = file.name.split('').some(c => c.charCodeAt(0) > 127)
+            ? encodeURIComponent(file.name)
+            : file.name;
 
         const ai = getGeminiClient();
         const settings = await getUserSettings(user.id, user.token);
@@ -156,7 +166,7 @@ export async function POST(
                 file: localPath,
                 config: {
                     mimeType,
-                    displayName: file.name
+                    displayName: safeDisplayName
                 }
             });
             finalDocumentName = uploadRes.name || finalDocumentName;
@@ -172,7 +182,7 @@ export async function POST(
             // MIME strings with INVALID_ARGUMENT. Let the API auto-detect from the
             // file bytes. We still track mimeType in our own DB record.
             const config: any = {
-                displayName: file.name,
+                displayName: safeDisplayName,
             };
 
             if (metadata && Object.keys(metadata).length > 0) {
