@@ -188,8 +188,20 @@ export async function POST(req: NextRequest) {
             message: assistantMessage,
             history: fullHistory
         });
-    } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : "Unknown error";
-        return NextResponse.json({ error: message }, { status: 500 });
+    } catch (error: any) {
+        console.error("Chat API error:", error);
+
+        // Handle Gemini Quota Exceeded Error
+        const errorMessage = error?.message?.toLowerCase() || "";
+        const errorStatus = error?.status;
+        if (errorStatus === 429 || errorMessage.includes("429") || errorMessage.includes("quota")) {
+            return NextResponse.json({
+                error: "QUOTA_EXCEEDED",
+                message: "You exceeded your current quota. Free tier allows 15 Requests Per Minute (RPM) and 1 Million Tokens Per Minute (TPM). Please wait a moment and try again."
+            }, { status: 429 });
+        }
+
+        const msg = error instanceof Error ? error.message : "Unknown error";
+        return NextResponse.json({ error: msg }, { status: 500 });
     }
 }

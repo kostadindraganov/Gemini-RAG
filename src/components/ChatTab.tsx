@@ -89,14 +89,24 @@ export default function ChatTab({ activeStoreId, accessToken }: { activeStoreId:
             });
 
             const data = await res.json();
+
+            // Handle specific quota error
+            if (res.status === 429 || data.error === "QUOTA_EXCEEDED") {
+                setMessages(prev => [...prev, {
+                    role: "model",
+                    content: `**Quota Exceeded ⚠️**\n\n${data.message || "You have exceeded your Gemini API limits. Free tier allows 15 Requests Per minute."}`
+                }]);
+                return;
+            }
+
             if (data.history) {
                 setMessages(data.history);
             } else {
                 throw new Error(data.error || "Unknown error");
             }
-        } catch (error) {
-            console.error(error);
-            setMessages(prev => [...prev, { role: "model", content: `**Error:** Failed to get response` }]);
+        } catch (error: any) {
+            console.error("Chat Error:", error);
+            setMessages(prev => [...prev, { role: "model", content: `**Error:** Failed to get response. ${error.message || ""}` }]);
         } finally {
             setIsLoading(false);
         }
