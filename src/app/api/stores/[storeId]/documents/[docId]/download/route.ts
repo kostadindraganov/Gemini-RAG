@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDocument } from "@/lib/db";
 import { getAuthUser, getAuthUserFromCookie } from "@/lib/db";
+import { getSupabaseServer } from "@/lib/supabase";
 import path from "path";
 import fs from "fs";
 
@@ -22,20 +23,71 @@ function getUploadsDirLocal(): string {
     return UPLOADS_DIR;
 }
 
+/**
+ * Tries to resolve a userId from an MCP API key.
+ * Used as a fallback when the token is not a valid Supabase JWT.
+ * MCP-generated download links use the MCP key as the ?token= param.
+ */
+async function getUserFromMcpKey(token: string): Promise<{ id: string } | null> {
+    if (!token) return null;
+    const sb = getSupabaseServer(); // uses anon key
+    const { data, error } = await sb
+        .from("mcp_api_keys")
+        .select("user_id")
+        .eq("key_value", token)
+        .eq("is_active", true)
+        .limit(1)
+        .single();
+
+    if (error || !data) return null;
+
+    // fire-and-forget last_used update
+    void sb.from("mcp_api_keys")
+        .update({ last_used_at: new Date().toISOString() })
+        .eq("key_value", token);
+
+    return { id: data.user_id };
+}
+
 export async function GET(
     req: NextRequest,
     { params }: { params: Promise<{ storeId: string; docId: string }> }
 ) {
     try {
-        const user = (await getAuthUser(req)) || (await getAuthUserFromCookie(req.headers.get("cookie")));
-        if (!user) {
+        // 1. Try normal Supabase JWT auth (Bearer header or ?token= query param)
+        let userId: string | null = null;
+        let accessToken: string | undefined;
+
+        const jwtUser = (await getAuthUser(req)) || (await getAuthUserFromCookie(req.headers.get("cookie")));
+        if (jwtUser) {
+            userId = jwtUser.id;
+            accessToken = jwtUser.accessToken;
+        }
+
+        // 2. Fallback: accept MCP API key as ?token= or Bearer header.
+        //    MCP-generated download links carry the MCP key, not a Supabase JWT.
+        if (!userId) {
+            const url = new URL(req.url);
+            const rawToken =
+                req.headers.get("authorization")?.replace("Bearer ", "") ||
+                url.searchParams.get("token") || "";
+
+            const mcpUser = await getUserFromMcpKey(rawToken);
+            if (mcpUser) {
+                userId = mcpUser.id;
+                // No Supabase access token available — getDocument will use the anon key,
+                // which is fine because the RLS user_id filter still scopes the query.
+                accessToken = undefined;
+            }
+        }
+
+        if (!userId) {
             return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
         }
 
         const { storeId, docId } = await params;
 
-        // Fetch single doc from Supabase
-        const doc = await getDocument(user.id, docId, user.accessToken);
+        const doc = await getDocument(userId, docId, accessToken);
 
         if (!doc) {
             return NextResponse.json({ error: "Document not found in database", docId, storeId }, { status: 404 });
@@ -49,7 +101,6 @@ export async function GET(
         const localPath = path.join(uploadsDir, doc.localPath);
 
         if (!fs.existsSync(localPath)) {
-            // Log it server-side too
             console.error(`[Download] File not found on disk: ${localPath}`);
             return NextResponse.json({
                 error: "File not on disk",

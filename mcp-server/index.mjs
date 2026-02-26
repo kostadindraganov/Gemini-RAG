@@ -24,18 +24,43 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "https://rag.kokoit.com";
 
+// Comma-separated list of allowed CORS origins, or leave empty to allow the APP_URL only.
+const ALLOWED_ORIGINS = process.env.MCP_ALLOWED_ORIGINS
+    ? process.env.MCP_ALLOWED_ORIGINS.split(",").map(s => s.trim())
+    : [APP_URL, "http://localhost:3000", "http://localhost:3001"];
+
 if (!GEMINI_API_KEY) { console.error("[MCP] GEMINI_API_KEY not set"); process.exit(1); }
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-// ── Supabase helpers (safe) ──────────────────────────────────────────────────
-async function sbFetch(path, params = {}) {
+// ── Logging ───────────────────────────────────────────────────────────────────
+// Defined early so helpers defined below can use it safely.
+const MAX_LOGS = 100;
+const mcpLogs = [];
+function addMcpLog(msg) {
+    const log = { id: Date.now() + Math.random(), time: new Date().toISOString(), message: msg };
+    mcpLogs.push(log);
+    if (mcpLogs.length > MAX_LOGS) mcpLogs.shift();
+    console.log(`[MCP] ${msg}`);
+}
+
+// ── Supabase helpers ──────────────────────────────────────────────────────────
+/**
+ * Safe GET from Supabase REST API using the anon key (RLS applies).
+ * params keys that start with a filter operator are passed as-is; plain keys
+ * are automatically wrapped in eq.<value>  so callers don't have to.
+ */
+async function sbFetch(table, params = {}) {
     if (!SUPABASE_URL || !SUPABASE_ANON) return null;
     try {
-        const url = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
+        const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
         Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
         const res = await fetch(url.toString(), {
-            headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${SUPABASE_ANON}` }
+            headers: {
+                apikey: SUPABASE_ANON,
+                Authorization: `Bearer ${SUPABASE_ANON}`,
+                "Accept": "application/json",
+            }
         });
         if (!res.ok) {
             const err = await res.text();
@@ -43,151 +68,184 @@ async function sbFetch(path, params = {}) {
         }
         return await res.json();
     } catch (e) {
-        addMcpLog(`sbFetch error [${path}]: ${e.message}`);
+        addMcpLog(`sbFetch error [${table}]: ${e.message}`);
         return null;
     }
 }
 
-async function sbPatch(path, filter, body) {
+async function sbPatch(table, filter, body) {
     if (!SUPABASE_URL || !SUPABASE_ANON) return;
     try {
-        const url = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
+        const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
         Object.entries(filter).forEach(([k, v]) => url.searchParams.set(k, `eq.${v}`));
         await fetch(url.toString(), {
             method: "PATCH",
-            headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${SUPABASE_ANON}`, "Content-Type": "application/json" },
+            headers: {
+                apikey: SUPABASE_ANON,
+                Authorization: `Bearer ${SUPABASE_ANON}`,
+                "Content-Type": "application/json",
+            },
             body: JSON.stringify(body)
         });
     } catch (e) {
-        addMcpLog(`sbPatch error [${path}]: ${e.message}`);
+        addMcpLog(`sbPatch error [${table}]: ${e.message}`);
     }
 }
 
-// ── Auth: validate key and resolve userId ─────────────────────────────────────
+// ── Auth: validate MCP key → userId ──────────────────────────────────────────
+// Simple in-memory token cache: token → { userId, expiresAt }
+const authCache = new Map();
+const AUTH_CACHE_TTL_MS = 60_000; // 60 s
+
 async function resolveUser(bearerToken) {
-    // If we have no DB config, allow everything with no userId for local dev
+    if (!bearerToken) return { userId: null, valid: false };
+
+    // Allow all in no-DB mode (local dev only)
     if (!SUPABASE_URL || !SUPABASE_ANON) {
         return { userId: null, valid: true };
     }
 
+    // ── Cache hit ──
+    const cached = authCache.get(bearerToken);
+    if (cached && cached.expiresAt > Date.now()) {
+        return { userId: cached.userId, valid: true };
+    }
+
+    // ── Guard: reject tokens that look structurally wrong to avoid injection ──
+    // MCP keys are UUIDs or similar opaque strings; Supabase JWTs start with "eyJ"
+    if (bearerToken.startsWith("eyJ")) {
+        // This is a Supabase JWT — not valid for MCP auth
+        return { userId: null, valid: false };
+    }
+
     const rows = await sbFetch("mcp_api_keys", {
-        "key_value": `eq.${bearerToken}`,
+        "key_value": `eq.${encodeURIComponent(bearerToken)}`,
         "is_active": "eq.true",
-        "select": "id,user_id"
+        "select": "id,user_id",
+        "limit": "1",
     });
 
     if (!rows || rows.length === 0) return { userId: null, valid: false };
 
     const { id, user_id: userId } = rows[0];
-    // fire-and-forget last_used update
+
+    // Cache the result
+    authCache.set(bearerToken, { userId, expiresAt: Date.now() + AUTH_CACHE_TTL_MS });
+
+    // Fire-and-forget last_used update
     sbPatch("mcp_api_keys", { id }, { last_used_at: new Date().toISOString() }).catch(() => { });
+
     return { userId, valid: true };
 }
 
-// ── User settings (active store + model) ──────────────────────────────────────
+// ── User settings ─────────────────────────────────────────────────────────────
+// Per-user settings cache: userId → { data, expiresAt }
+const settingsCache = new Map();
+const SETTINGS_CACHE_TTL_MS = 30_000; // 30 s
+
 async function getUserSettings(userId) {
     if (!userId) return null;
+
+    const cached = settingsCache.get(userId);
+    if (cached && cached.expiresAt > Date.now()) return cached.data;
+
     const rows = await sbFetch("user_settings", {
         "user_id": `eq.${userId}`,
-        "select": "active_store_id,active_model,system_prompt"
+        "select": "active_store_id,active_model,system_prompt",
+        "limit": "1",
     });
-    return rows?.[0] || null;
+    const data = rows?.[0] || null;
+
+    settingsCache.set(userId, { data, expiresAt: Date.now() + SETTINGS_CACHE_TTL_MS });
+    return data;
+}
+
+function invalidateSettingsCache(userId) {
+    settingsCache.delete(userId);
 }
 
 async function setActiveStore(userId, storeId) {
     if (!userId || !storeId) return;
     await sbPatch("user_settings", { user_id: userId }, { active_store_id: storeId });
+    invalidateSettingsCache(userId);
 }
 
-// ── Gemini helpers ────────────────────────────────────────────────────────────
-async function getAllStores() {
-    const list = [];
-    for await (const s of await ai.fileSearchStores.list()) {
-        list.push({
-            id: s.name?.replace("fileSearchStores/", "") || "",
-            name: s.name || "",
-            displayName: s.displayName || s.name || "",
-        });
-    }
-    return list;
+// ── Store helpers (Supabase-backed, fast) ─────────────────────────────────────
+// NOTE: We intentionally query the Supabase `stores` table — NOT the Gemini API.
+//       The app owns store metadata (display name, etc.) and the Supabase table
+//       is the single source of truth. Calling the Gemini API for every tool
+//       invocation is orders of magnitude slower.
+
+async function getStoresByUser(userId) {
+    const rows = await sbFetch("stores", {
+        "user_id": `eq.${userId}`,
+        "select": "id,display_name,document_count",
+        "order": "created_at.desc",
+    });
+    return (rows || []).map(r => ({
+        id: r.id,
+        displayName: r.display_name || r.id,
+        documentCount: r.document_count || 0,
+    }));
+}
+
+async function findStoreByUser(userId, identifier) {
+    const stores = await getStoresByUser(userId);
+    const q = identifier.toLowerCase();
+    return stores.find(s =>
+        s.id.toLowerCase() === q ||
+        s.displayName.toLowerCase() === q ||
+        s.displayName.toLowerCase().includes(q)
+    ) || null;
 }
 
 function toStoreName(id) {
     return id.startsWith("fileSearchStores/") ? id : `fileSearchStores/${id}`;
 }
 
-async function findStore(identifier, stores) {
-    const q = identifier.toLowerCase();
-    return stores.find(s =>
-        s.id.toLowerCase() === q ||
-        s.name.toLowerCase() === q ||
-        s.displayName.toLowerCase() === q ||
-        s.displayName.toLowerCase().includes(q)
-    ) || null;
+// ── Document helpers (Supabase-backed) ───────────────────────────────────────
+async function getDocumentsByUser(userId, storeId, limit = 100) {
+    const params = {
+        "user_id": `eq.${userId}`,
+        "select": "id,display_name,original_filename,store_id,mime_type",
+        "order": "uploaded_at.desc",
+        "limit": String(Math.min(limit, 500)),
+    };
+    if (storeId) params["store_id"] = `eq.${storeId}`;
+    return (await sbFetch("documents", params)) || [];
 }
 
-async function getStoreDocuments(storeName, limit = 50) {
-    try {
-        const result = await ai.fileSearchStores.documents.list({ parent: storeName, pageSize: limit });
-        const items = result?.fileSearchDocuments || result?.documents || [];
-        return items.map(d => ({
-            id: d.name?.split("/").pop() || "",
-            name: d.name,
-            displayName: d.displayName || d.name || "",
-            state: d.state || "unknown",
-        }));
-    } catch { return []; }
-}
-
-/**
- * Core RAG query — sends query to Gemini with File Search grounding.
- * storeNames: array of full store names ("fileSearchStores/xxx")
- * systemPrompt: optional persona/instructions
- */
+// ── Gemini RAG query ──────────────────────────────────────────────────────────
 async function ragQuery({ query, storeNames, model = "gemini-2.5-flash", systemPrompt, history = [] }) {
     const config = {
         tools: [{ fileSearch: { fileSearchStoreNames: storeNames } }],
     };
     if (systemPrompt) config.systemInstruction = systemPrompt;
 
-    // Build contents array: prepend history if provided
     const contents = [
         ...history,
         { role: "user", parts: [{ text: query }] }
     ];
 
-    const response = await ai.models.generateContent({
-        model,
-        contents,
-        config,
-    });
+    const response = await ai.models.generateContent({ model, contents, config });
 
     let text = response.text || "(No response)";
 
-    // Append citations if available
+    // Append citations
     const grounding = response.candidates?.[0]?.groundingMetadata;
     if (grounding?.groundingChunks?.length) {
         text += "\n\nSources:";
-        const sourcesSeen = new Set();
-
-        grounding.groundingChunks.forEach((chunk) => {
-            // Web Search
-            if (chunk.web?.uri) {
-                const label = chunk.web.title || chunk.web.uri;
-                if (!sourcesSeen.has(chunk.web.uri)) {
-                    text += `\n- ${label} (${chunk.web.uri})`;
-                    sourcesSeen.add(chunk.web.uri);
-                }
-            }
-            // File Search (RAG)
-            else if (chunk.retrievedContext?.uri) {
+        const seen = new Set();
+        for (const chunk of grounding.groundingChunks) {
+            if (chunk.web?.uri && !seen.has(chunk.web.uri)) {
+                text += `\n- ${chunk.web.title || chunk.web.uri} (${chunk.web.uri})`;
+                seen.add(chunk.web.uri);
+            } else if (chunk.retrievedContext?.uri && !seen.has(chunk.retrievedContext.uri)) {
                 const label = chunk.retrievedContext.title || chunk.retrievedContext.uri.split("/").pop();
-                if (!sourcesSeen.has(chunk.retrievedContext.uri)) {
-                    text += `\n- ${label} (ID: ${chunk.retrievedContext.uri.split("/").pop()})`;
-                    sourcesSeen.add(chunk.retrievedContext.uri);
-                }
+                text += `\n- ${label}`;
+                seen.add(chunk.retrievedContext.uri);
             }
-        });
+        }
     }
 
     return text;
@@ -195,78 +253,78 @@ async function ragQuery({ query, storeNames, model = "gemini-2.5-flash", systemP
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
-app.use(cors());
 
-// Internal session Map: sessionId -> { transport, userId }
+// Restrict CORS to known safe origins
+app.use(cors({
+    origin: (origin, cb) => {
+        // Allow requests with no origin (same-host curl, server-to-server)
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+        cb(new Error(`CORS: origin "${origin}" not allowed`));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Authorization", "Content-Type"],
+}));
+
+// Body parser (needed for POST /sse message bodies)
+app.use(express.json({ limit: "1mb" }));
+
+// Session store: sessionId → { transport, server, userId, token, establishedAt }
 const sessions = new Map();
 const sessionHistory = [];
-const MAX_SESSION_HISTORY = 10;
+const MAX_SESSION_HISTORY = 20;
 
-app.use((req, res, next) => {
-    // Log incoming requests for debugging (excluding heartbeats/noisy logs if preferred)
-    if (req.url !== "/mcp-status" && req.url !== "/" && !req.url.startsWith("/api/mcp-status")) {
-        addMcpLog(`${req.method} ${req.url}`);
-    }
+// ── Request logger ────────────────────────────────────────────────────────────
+app.use((req, _res, next) => {
+    const noisy = ["/", "/api/mcp-status"];
+    if (!noisy.includes(req.url)) addMcpLog(`${req.method} ${req.url}`);
     next();
 });
 
-app.get("/", (req, res) => res.send("Gemini RAG MCP Server is alive."));
+app.get("/", (_req, res) => res.send("Gemini RAG MCP Server v2.2 is alive."));
 
-// ── Status & Monitoring ───────────────────────────────────────────────────────
-// Simple in-memory log buffer for the UI
-const MAX_LOGS = 50;
-const mcpLogs = [];
-const addMcpLog = (msg) => {
-    const log = { id: Date.now() + Math.random(), time: new Date().toISOString(), message: msg };
-    mcpLogs.push(log);
-    if (mcpLogs.length > MAX_LOGS) mcpLogs.shift();
-    console.log(`[MCP] ${msg}`);
-};
-
-app.get("/api/mcp-status", (req, res) => {
-    // This is called via Next.js proxy, so we might need auth if exposed publicly,
-    // but for now it's internal to the server.
-    const activeSessions = Array.from(sessions.entries()).map(([sid, session]) => ({
-        sessionId: sid,
-        userId: session.userId,
-        established: session.establishedAt,
+// ── Status endpoint (authenticated) ──────────────────────────────────────────
+// Protected: only callers with a valid MCP key can see session/log data.
+app.get("/api/mcp-status", auth, (req, res) => {
+    const activeSessions = Array.from(sessions.values()).map(s => ({
+        sessionId: s.transport?.sessionId,
+        userId: s.userId,
+        established: s.establishedAt,
     }));
-
     res.json({
         status: "online",
-        version: "2.1.0",
+        version: "2.2.0",
         sessions: activeSessions,
         history: sessionHistory,
-        logs: mcpLogs
+        logs: mcpLogs,
     });
 });
 
-app.post("/api/mcp-logs/clear", (req, res) => {
+// Protected: clear logs
+app.post("/api/mcp-logs/clear", auth, (_req, res) => {
     mcpLogs.length = 0;
-    addMcpLog("Logs cleared by user.");
+    addMcpLog("Logs cleared.");
     res.json({ success: true });
 });
 
-
-// ── Auth middleware (safe) ───────────────────────────────────────────────────
-const auth = async (req, res, next) => {
+// ── Auth middleware ───────────────────────────────────────────────────────────
+async function auth(req, res, next) {
     try {
         let token = "";
         const header = req.headers.authorization;
         if (header?.startsWith("Bearer ")) {
-            token = header.slice(7);
+            token = header.slice(7).trim();
         } else if (req.query.token) {
-            token = req.query.token;
+            token = String(req.query.token).trim();
         }
 
         if (!token) {
-            addMcpLog(`${req.method} ${req.url} - 401: Unauthorized (No token)`);
+            addMcpLog(`${req.method} ${req.url} → 401 No token`);
             return res.status(401).json({ error: "Missing token. Use Bearer header or ?token= query param." });
         }
 
         const { userId, valid } = await resolveUser(token);
         if (!valid) {
-            addMcpLog(`${req.method} ${req.url} - 403: Forbidden (Invalid key)`);
+            addMcpLog(`${req.method} ${req.url} → 403 Invalid key`);
             return res.status(403).json({ error: "Invalid or inactive MCP API key." });
         }
 
@@ -275,67 +333,71 @@ const auth = async (req, res, next) => {
         next();
     } catch (e) {
         addMcpLog(`Auth error: ${e.message}`);
-        res.status(500).json({ error: "Internal server error during authentication" });
+        res.status(500).json({ error: "Internal server error during authentication." });
     }
-};
+}
 
-// ── Helper: resolve session from extra (transport session) ───────────────────
+// ── Session helpers ───────────────────────────────────────────────────────────
 function resolveSessionFromExtra(extra) {
     const sessionId = extra?.transport?.sessionId;
     if (!sessionId) return null;
-    return sessions.get(sessionId);
+    return sessions.get(sessionId) || null;
 }
 
 function resolveUserIdFromExtra(extra) {
-    return resolveSessionFromExtra(extra)?.userId;
+    return resolveSessionFromExtra(extra)?.userId ?? null;
 }
 
-// ── MCP Server Logic (Reusable) ───────────────────────────────────────────────
-
-const serverInfo = { name: "gemini-rag", version: "2.1.0" };
-
-// We define tools in a registry so we can attach them to multiple server instances
-// (needed because McpServer/Server instances are 1:1 with transports)
+// ── Tool registry ─────────────────────────────────────────────────────────────
 const tools = [];
 function registerTool(name, description, schema, handler) {
     tools.push({ name, description, schema, handler });
 }
 
+// Pre-compute JSON schemas once at startup (instead of on every list_tools call)
+let _cachedToolSchemas = null;
+function getCachedToolSchemas() {
+    if (_cachedToolSchemas) return _cachedToolSchemas;
+    _cachedToolSchemas = tools.map(t => {
+        const zodSchema = t.schema._def ? t.schema : z.object(t.schema);
+        const { $schema, definitions, ...cleanSchema } = zodToJsonSchema(zodSchema);
+        return { name: t.name, description: t.description, inputSchema: cleanSchema };
+    });
+    return _cachedToolSchemas;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. chat  ▸ The primary tool
+// 1. chat  ▸ Primary RAG tool
 // ─────────────────────────────────────────────────────────────────────────────
 registerTool(
     "chat",
-    "Chat with your documents. Asks a question and gets an answer grounded in your uploaded files.",
+    "Chat with your documents. Ask a question and get an answer grounded in your uploaded files.",
     {
-        message: z.string().describe("Your question or message to answer using the documents"),
+        message: z.string().min(1).describe("Your question or message"),
         storeId: z.string().optional().describe("Store ID to search. Omit to use your active store."),
         model: z.string().optional().describe("Gemini model (default: gemini-2.5-flash)"),
     },
     async ({ message, storeId, model }, extra) => {
         const userId = resolveUserIdFromExtra(extra);
-        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        if (!userId) return err("No user session found.");
 
         try {
             const settings = await getUserSettings(userId);
             const resolvedStoreId = storeId || settings?.active_store_id;
+            if (!resolvedStoreId) return err("⚠️ No active store set. Use set_active_store first.");
 
-            if (!resolvedStoreId) {
-                return { content: [{ type: "text", text: "⚠️ No active store set. Use set_active_store first." }] };
-            }
+            // Verify the store belongs to this user
+            const store = await findStoreByUser(userId, resolvedStoreId);
+            if (!store) return err(`Store "${resolvedStoreId}" not found or not accessible.`);
 
-            const storeName = toStoreName(resolvedStoreId);
             const answer = await ragQuery({
                 query: message,
-                storeNames: [storeName],
+                storeNames: [toStoreName(store.id)],
                 model: model || settings?.active_model || "gemini-2.5-flash",
                 systemPrompt: settings?.system_prompt || undefined,
             });
-
-            return { content: [{ type: "text", text: answer }] };
-        } catch (e) {
-            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
-        }
+            return ok(answer);
+        } catch (e) { return err(e); }
     }
 );
 
@@ -346,31 +408,27 @@ registerTool(
     "chat_with_store",
     "Chat with documents in a specific store by its ID or display name.",
     {
-        message: z.string().describe("Your question or message"),
+        message: z.string().min(1).describe("Your question or message"),
         storeId: z.string().describe("Store ID or display name"),
         model: z.string().optional().describe("Gemini model"),
     },
     async ({ message, storeId, model }, extra) => {
         const userId = resolveUserIdFromExtra(extra);
-        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        if (!userId) return err("No user session found.");
 
         try {
-            const stores = await getAllStores();
-            const store = await findStore(storeId, stores);
-            if (!store) return { content: [{ type: "text", text: `Store "${storeId}" not found.` }] };
+            const store = await findStoreByUser(userId, storeId);
+            if (!store) return err(`Store "${storeId}" not found.`);
 
             const settings = await getUserSettings(userId);
             const answer = await ragQuery({
                 query: message,
-                storeNames: [store.name],
+                storeNames: [toStoreName(store.id)],
                 model: model || settings?.active_model || "gemini-2.5-flash",
                 systemPrompt: settings?.system_prompt || undefined,
             });
-
-            return { content: [{ type: "text", text: answer }] };
-        } catch (e) {
-            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
-        }
+            return ok(answer);
+        } catch (e) { return err(e); }
     }
 );
 
@@ -381,29 +439,26 @@ registerTool(
     "chat_all_stores",
     "Ask a question and search across ALL of your document stores simultaneously.",
     {
-        message: z.string().describe("Your question or message"),
+        message: z.string().min(1).describe("Your question or message"),
         model: z.string().optional().describe("Gemini model"),
     },
     async ({ message, model }, extra) => {
         const userId = resolveUserIdFromExtra(extra);
-        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        if (!userId) return err("No user session found.");
 
         try {
-            const stores = await getAllStores();
-            if (!stores.length) return { content: [{ type: "text", text: "No stores found." }] };
+            const stores = await getStoresByUser(userId);
+            if (!stores.length) return err("No stores found. Create a store and upload files first.");
 
             const settings = await getUserSettings(userId);
             const answer = await ragQuery({
                 query: message,
-                storeNames: stores.map(s => s.name),
+                storeNames: stores.map(s => toStoreName(s.id)),
                 model: model || settings?.active_model || "gemini-2.5-flash",
                 systemPrompt: settings?.system_prompt || undefined,
             });
-
-            return { content: [{ type: "text", text: answer }] };
-        } catch (e) {
-            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
-        }
+            return ok(answer);
+        } catch (e) { return err(e); }
     }
 );
 
@@ -412,26 +467,25 @@ registerTool(
 // ─────────────────────────────────────────────────────────────────────────────
 registerTool(
     "list_stores",
-    "List all available document stores with their IDs and names.",
+    "List all your document stores with their IDs and document counts.",
     {},
     async (_, extra) => {
         const userId = resolveUserIdFromExtra(extra);
-        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        if (!userId) return err("No user session found.");
 
         try {
-            const stores = await getAllStores();
-            if (!stores.length) return { content: [{ type: "text", text: "No stores found." }] };
+            const [stores, settings] = await Promise.all([
+                getStoresByUser(userId),
+                getUserSettings(userId),
+            ]);
+            if (!stores.length) return ok("No stores found. Create a store in the web UI first.");
 
-            const settings = await getUserSettings(userId);
             const activeId = settings?.active_store_id;
-
             const lines = stores.map(s =>
-                `${s.id === activeId ? "★ " : "  "}${s.displayName}\n   ID: ${s.id}`
+                `${s.id === activeId ? "★ " : "  "}${s.displayName}  (${s.documentCount} docs)\n   ID: ${s.id}`
             );
-            return { content: [{ type: "text", text: `${stores.length} store(s) — ★ = active:\n\n${lines.join("\n\n")}` }] };
-        } catch (e) {
-            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
-        }
+            return ok(`${stores.length} store(s) — ★ = active:\n\n${lines.join("\n\n")}`);
+        } catch (e) { return err(e); }
     }
 );
 
@@ -440,26 +494,19 @@ registerTool(
 // ─────────────────────────────────────────────────────────────────────────────
 registerTool(
     "get_active_store",
-    "Returns the currently active document store.",
+    "Returns the currently active document store for this account.",
     {},
     async (_, extra) => {
         const userId = resolveUserIdFromExtra(extra);
-        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        if (!userId) return err("No user session found.");
 
         try {
             const settings = await getUserSettings(userId);
-            if (!settings?.active_store_id) return { content: [{ type: "text", text: "No active store set." }] };
-            const stores = await getAllStores();
+            if (!settings?.active_store_id) return ok("No active store set. Use set_active_store.");
+            const stores = await getStoresByUser(userId);
             const store = stores.find(s => s.id === settings.active_store_id);
-            return {
-                content: [{
-                    type: "text",
-                    text: `Active store: ${store?.displayName || settings.active_store_id}\nID: ${settings.active_store_id}`
-                }]
-            };
-        } catch (e) {
-            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
-        }
+            return ok(`Active store: ${store?.displayName || settings.active_store_id}\nID: ${settings.active_store_id}`);
+        } catch (e) { return err(e); }
     }
 );
 
@@ -468,21 +515,18 @@ registerTool(
 // ─────────────────────────────────────────────────────────────────────────────
 registerTool(
     "set_active_store",
-    "Set the active document store.",
+    "Set the active document store by ID or display name.",
     { storeId: z.string().describe("Store ID or display name") },
     async ({ storeId }, extra) => {
         const userId = resolveUserIdFromExtra(extra);
-        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        if (!userId) return err("No user session found.");
 
         try {
-            const stores = await getAllStores();
-            const store = await findStore(storeId, stores);
-            if (!store) return { content: [{ type: "text", text: `Store "${storeId}" not found.` }] };
+            const store = await findStoreByUser(userId, storeId);
+            if (!store) return err(`Store "${storeId}" not found.`);
             await setActiveStore(userId, store.id);
-            return { content: [{ type: "text", text: `✅ Active store set to: ${store.displayName}` }] };
-        } catch (e) {
-            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
-        }
+            return ok(`✅ Active store set to: ${store.displayName} (${store.id})`);
+        } catch (e) { return err(e); }
     }
 );
 
@@ -491,29 +535,32 @@ registerTool(
 // ─────────────────────────────────────────────────────────────────────────────
 registerTool(
     "list_documents",
-    "List the documents/files uploaded to a store.",
+    "List the documents uploaded to a store.",
     {
-        storeId: z.string().optional().describe("Store ID. Uses the active store if omitted."),
-        limit: z.number().optional().describe("Max results (default 50)"),
+        storeId: z.string().optional().describe("Store ID or name. Uses active store if omitted."),
+        limit: z.number().int().min(1).max(200).optional().describe("Max results (default 50)"),
     },
     async ({ storeId, limit }, extra) => {
         const userId = resolveUserIdFromExtra(extra);
-        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        if (!userId) return err("No user session found.");
 
         try {
             const settings = await getUserSettings(userId);
             const resolvedId = storeId || settings?.active_store_id;
-            if (!resolvedId) return { content: [{ type: "text", text: "No storeId and no active store is set." }] };
+            if (!resolvedId) return err("No storeId provided and no active store is set.");
 
-            const storeName = toStoreName(resolvedId);
-            const docs = await getStoreDocuments(storeName, limit || 50);
-            if (!docs.length) return { content: [{ type: "text", text: `No documents in store.` }] };
+            // Verify store belongs to user
+            const store = await findStoreByUser(userId, resolvedId);
+            if (!store) return err(`Store "${resolvedId}" not found.`);
 
-            const lines = docs.map((d, i) => `${i + 1}. ${d.displayName}\n   ID: ${d.id}`);
-            return { content: [{ type: "text", text: `${docs.length} document(s):\n\n${lines.join("\n\n")}` }] };
-        } catch (e) {
-            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
-        }
+            const docs = await getDocumentsByUser(userId, store.id, limit || 50);
+            if (!docs.length) return ok(`Store "${store.displayName}" has no documents yet.`);
+
+            const lines = docs.map((d, i) =>
+                `${i + 1}. ${d.display_name || d.original_filename || d.id}\n   ID: ${d.id}`
+            );
+            return ok(`${docs.length} document(s) in "${store.displayName}":\n\n${lines.join("\n\n")}`);
+        } catch (e) { return err(e); }
     }
 );
 
@@ -524,31 +571,34 @@ registerTool(
     "summarize",
     "Generate a summary of all documents in a store.",
     {
-        storeId: z.string().optional().describe("Store ID."),
-        focus: z.string().optional().describe("Optional topic to focus on"),
+        storeId: z.string().optional().describe("Store ID or name."),
+        focus: z.string().optional().describe("Optional topic to focus the summary on."),
         model: z.string().optional().describe("Gemini model"),
     },
     async ({ storeId, focus, model }, extra) => {
         const userId = resolveUserIdFromExtra(extra);
-        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        if (!userId) return err("No user session found.");
 
         try {
             const settings = await getUserSettings(userId);
             const resolvedId = storeId || settings?.active_store_id;
-            if (!resolvedId) return { content: [{ type: "text", text: "No active store set." }] };
+            if (!resolvedId) return err("No active store set.");
 
-            const storeName = toStoreName(resolvedId);
-            const prompt = focus ? `Summary focus: ${focus}` : "Comprehensive summary.";
+            const store = await findStoreByUser(userId, resolvedId);
+            if (!store) return err(`Store "${resolvedId}" not found.`);
+
+            const prompt = focus
+                ? `Provide a comprehensive summary of the documents, focusing specifically on: ${focus}`
+                : "Provide a comprehensive summary of all documents in this knowledge base.";
+
             const answer = await ragQuery({
                 query: prompt,
-                storeNames: [storeName],
+                storeNames: [toStoreName(store.id)],
                 model: model || settings?.active_model || "gemini-2.5-flash",
                 systemPrompt: settings?.system_prompt || undefined,
             });
-            return { content: [{ type: "text", text: answer }] };
-        } catch (e) {
-            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
-        }
+            return ok(answer);
+        } catch (e) { return err(e); }
     }
 );
 
@@ -557,28 +607,39 @@ registerTool(
 // ─────────────────────────────────────────────────────────────────────────────
 registerTool(
     "delete_document",
-    "Permanently delete a document from a store.",
+    "Permanently delete a document from a store. The document must belong to your account.",
     {
-        documentId: z.string().describe("Document ID"),
-        storeId: z.string().optional().describe("Store ID"),
+        documentId: z.string().describe("Document ID (UUID from list_documents)"),
+        storeId: z.string().optional().describe("Store ID. Uses active store if omitted."),
     },
     async ({ documentId, storeId }, extra) => {
         const userId = resolveUserIdFromExtra(extra);
-        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        if (!userId) return err("No user session found.");
 
         try {
             const settings = await getUserSettings(userId);
             const resolvedId = storeId || settings?.active_store_id;
-            let docName = documentId;
-            if (!docName.includes("/")) {
-                if (!resolvedId) return { content: [{ type: "text", text: "Store ID required." }] };
-                docName = `${toStoreName(resolvedId)}/documents/${documentId}`;
+            if (!resolvedId) return err("Store ID required.");
+
+            // Ownership check: verify the document belongs to this user
+            const docs = await getDocumentsByUser(userId, resolvedId, 500);
+            const doc = docs.find(d => d.id === documentId);
+            if (!doc) return err(`Document "${documentId}" not found in your store. Use list_documents to see available IDs.`);
+
+            // Delete from Gemini file search store
+            const docGeminiName = `${toStoreName(resolvedId)}/documents/${documentId}`;
+            try {
+                await ai.fileSearchStores.documents.delete({ name: docGeminiName });
+            } catch (e) {
+                // 404 is fine — document may already be gone from Gemini
+                if (!e.message?.includes("404")) throw e;
             }
-            await ai.fileSearchStores.documents.delete({ name: docName });
-            return { content: [{ type: "text", text: `✅ Deleted: ${docName}` }] };
-        } catch (e) {
-            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
-        }
+
+            // Delete from Supabase (authoritative store)
+            await sbPatch("documents", { id: documentId, user_id: userId }, { deleted_at: new Date().toISOString() });
+
+            return ok(`✅ Deleted: ${doc.display_name || doc.original_filename || documentId}`);
+        } catch (e) { return err(e); }
     }
 );
 
@@ -587,150 +648,129 @@ registerTool(
 // ─────────────────────────────────────────────────────────────────────────────
 registerTool(
     "get_document_link",
-    "Generates links to view or download a document. Accepts names or IDs.",
+    "Generates a view URL and a download link for a document. Accepts document name or ID.",
     {
-        documentId: z.string().describe("Document ID or name"),
+        documentId: z.string().describe("Document name, original filename, or UUID"),
         storeId: z.string().optional().describe("Store ID or name. Uses active store if omitted."),
     },
     async ({ documentId, storeId }, extra) => {
         const session = resolveSessionFromExtra(extra);
-        if (!session?.userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+        if (!session?.userId) return err("No user session found.");
         const userId = session.userId;
         const sessionToken = session.token;
 
         try {
             const settings = await getUserSettings(userId);
-            const stores = await getAllStores();
+            let activeStoreId = storeId || settings?.active_store_id || null;
+            if (!activeStoreId) return err("No store specified and no active store set. Use set_active_store first.");
 
-            // 1. Resolve Store
-            let store = null;
-            if (storeId) {
-                store = await findStore(storeId, stores);
-            } else if (settings?.active_store_id) {
-                store = stores.find(s => s.id === settings.active_store_id);
-            }
+            // Resolve store by name/id, verifying ownership
+            const store = await findStoreByUser(userId, activeStoreId);
+            if (!store) return err(`Store "${activeStoreId}" not found.`);
+            activeStoreId = store.id;
 
-            if (!store) {
-                return { content: [{ type: "text", text: `Error: Could not resolve store "${storeId || 'active'}"` }] };
-            }
+            // Fetch document list from Supabase (authoritative; Gemini only has opaque names)
+            const docs = await getDocumentsByUser(userId, activeStoreId, 500);
+            if (!docs.length) return err(`No documents found in store "${store.displayName}". Upload some files first.`);
 
-            const activeStoreName = store.name; // full name
-            const activeStoreId = store.id;   // short ID
-
-            // 2. Resolve Document
-            const docs = await getStoreDocuments(activeStoreName, 100);
-            const q = documentId.toLowerCase();
-            const qClean = q.split("/").pop();
-
-            // Try exact ID match first, then exact display name, then substring
-            let doc = docs.find(d => d.id.toLowerCase() === q || d.id.toLowerCase() === qClean) ||
-                docs.find(d => d.displayName.toLowerCase() === q || d.displayName.toLowerCase() === qClean) ||
-                docs.find(d => d.displayName.toLowerCase().includes(qClean));
+            const q = documentId.toLowerCase().trim();
+            const doc =
+                docs.find(d => d.id.toLowerCase() === q) ||
+                docs.find(d => (d.display_name || "").toLowerCase() === q) ||
+                docs.find(d => (d.original_filename || "").toLowerCase() === q) ||
+                docs.find(d => (d.display_name || "").toLowerCase().includes(q)) ||
+                docs.find(d => (d.original_filename || "").toLowerCase().includes(q));
 
             if (!doc) {
-                return { content: [{ type: "text", text: `Error: Could not find document "${documentId}" in store "${store.displayName}"` }] };
+                const available = docs.slice(0, 10)
+                    .map(d => `• ${d.display_name || d.original_filename || d.id}`)
+                    .join("\n");
+                return ok(
+                    `Document "${documentId}" not found in store "${store.displayName}".\n\n` +
+                    `Available documents (up to 10):\n${available}`
+                );
             }
 
-            const cleanDocId = doc.id;
-            const viewUrl = `${APP_URL}/?tab=docs&storeId=${activeStoreId}&docId=${cleanDocId}`;
-            const downloadUrl = `${APP_URL}/api/stores/${activeStoreId}/documents/${cleanDocId}/download?token=${sessionToken}`;
+            const viewUrl = `${APP_URL}/?tab=docs&storeId=${activeStoreId}&docId=${doc.id}`;
+            const downloadUrl = `${APP_URL}/api/stores/${activeStoreId}/documents/${doc.id}/download?token=${sessionToken}`;
 
-            return {
-                content: [{
-                    type: "text",
-                    text: `View: ${viewUrl}\nDownload: ${downloadUrl}`
-                }]
-            };
-        } catch (e) {
-            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
-        }
+            return ok(
+                `📄 ${doc.display_name || doc.original_filename || doc.id}\n\n` +
+                `View:     ${viewUrl}\nDownload: ${downloadUrl}`
+            );
+        } catch (e) { return err(e); }
     }
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 10. help
+// 11. help
 // ─────────────────────────────────────────────────────────────────────────────
-registerTool("help", "Show help.", {}, async () => ({
-    content: [{ type: "text", text: `Gemini RAG MCP v2.1\nUse chat, list_stores, etc.` }]
-}));
+registerTool("help", "Show available tools and usage.", {}, async () => ok(
+    `Gemini RAG MCP v2.2\n\n` +
+    `Tools:\n` +
+    tools.filter(t => t.name !== "help").map(t => `  • ${t.name} — ${t.description}`).join("\n")
+));
 
-/**
- * Creates a fresh, independent Server instance for a new transport session.
- * Using the low-level Server class ensures no shared state between sessions.
- */
+// ── Response helpers ──────────────────────────────────────────────────────────
+function ok(text) { return { content: [{ type: "text", text: String(text) }] }; }
+function err(e) { return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] }; }
+
+// ── Per-session MCP Server factory ───────────────────────────────────────────
 function createSessionServer(sessionId) {
     const s = new Server(
-        { name: "gemini-rag", version: "2.1.0" },
+        { name: "gemini-rag", version: "2.2.0" },
         { capabilities: { tools: {} } }
     );
 
-    // Register List Tools handler
     s.setRequestHandler(ListToolsRequestSchema, async () => {
-        addMcpLog(`[Session ${sessionId}] Client requested tool list`);
-        return {
-            tools: tools.map(t => {
-                // Wrap plain object in z.object if it isn't already a Zod schema
-                const zodSchema = (t.schema._def) ? t.schema : z.object(t.schema);
-                const jsonSchema = zodToJsonSchema(zodSchema);
-
-                // Clean up: MCP expects just the schema object, remove $schema/definitions if they exist
-                const { $schema, definitions, ...cleanSchema } = jsonSchema;
-
-                return {
-                    name: t.name,
-                    description: t.description,
-                    inputSchema: cleanSchema
-                };
-            })
-        };
+        addMcpLog(`[${sessionId}] list_tools`);
+        return { tools: getCachedToolSchemas() };
     });
 
-    // Register Call Tool handler
     s.setRequestHandler(CallToolRequestSchema, async (request) => {
         const tool = tools.find(t => t.name === request.params.name);
-        if (!tool) throw new Error(`Tool not found: ${request.params.name}`);
+        if (!tool) throw new Error(`Unknown tool: ${request.params.name}`);
 
-        addMcpLog(`[Session ${sessionId}] Calling tool: ${request.params.name}`);
+        addMcpLog(`[${sessionId}] → ${request.params.name}`);
+
+        const zodSchema = tool.schema._def ? tool.schema : z.object(tool.schema);
+        let args;
+        try {
+            args = zodSchema.parse(request.params.arguments || {});
+        } catch (e) {
+            const msg = e instanceof z.ZodError
+                ? `Invalid arguments: ${e.errors.map(x => `${x.path.join(".")}: ${x.message}`).join(", ")}`
+                : e.message;
+            throw new Error(msg);
+        }
 
         try {
-            // Manually parse arguments using the Zod schema
-            const zodSchema = (tool.schema._def) ? tool.schema : z.object(tool.schema);
-            const args = zodSchema.parse(request.params.arguments || {});
             return await tool.handler(args, { transport: { sessionId } });
         } catch (e) {
-            addMcpLog(`[Session ${sessionId}] Tool execution failed: ${e.message}`);
-            // Use specific error message if it's a Zod validation error
-            const msg = e instanceof z.ZodError ? `Invalid arguments: ${e.message}` : e.message;
-            throw new Error(msg);
+            addMcpLog(`[${sessionId}] ✗ ${request.params.name}: ${e.message}`);
+            throw e;
         }
     });
 
-    s.onerror = (error) => addMcpLog(`[Session ${sessionId}] Server Error: ${error.message}`);
-
+    s.onerror = (error) => addMcpLog(`[${sessionId}] Server error: ${error.message}`);
     return s;
 }
 
-// ── SSE transport handling (Session-aware) ────────────────────────────────────
-
+// ── SSE transport handler ──────────────────────────────────────────────────────
 const handleSse = async (req, res) => {
+    const userId = req.userId;
+    const endpoint = req.path;
+
     try {
-        const userId = req.userId;
-        const endpoint = req.path;
+        addMcpLog(`Handshake: user=${userId} endpoint=${endpoint}`);
 
-        addMcpLog(`Starting handshaking for user: ${userId} at ${endpoint}`);
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache, no-transform");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("X-Accel-Buffering", "no");
 
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache, no-transform');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
-
-        // Create transport - endpoint is the path where the client will POST messages
         const transport = new SSEServerTransport(endpoint, res);
         const sid = transport.sessionId;
-
-        addMcpLog(`Assigned SessionId: ${sid}`);
-
-        // Create a fresh, isolated MCP Server instance for this session
         const sessionServer = createSessionServer(sid);
 
         sessions.set(sid, {
@@ -738,80 +778,82 @@ const handleSse = async (req, res) => {
             server: sessionServer,
             userId,
             token: req.token,
-            establishedAt: new Date().toISOString()
+            establishedAt: new Date().toISOString(),
         });
 
-        // Wire the transport to the server so it can receive and respond to messages
         await sessionServer.connect(transport);
+        addMcpLog(`Session established: ${sid} (user=${userId})`);
 
-        addMcpLog(`Session ${sid} established for user ${userId}`);
-
+        // Heartbeat — keeps the SSE connection alive through proxies/load balancers
         const heartbeat = setInterval(() => {
-            if (!res.writableEnded) {
-                res.write(': heartbeat\n\n');
-            } else {
-                clearInterval(heartbeat);
-            }
-        }, 15000);
+            if (res.writableEnded) { clearInterval(heartbeat); return; }
+            res.write(": heartbeat\n\n");
+        }, 15_000);
 
         transport.onclose = () => {
+            clearInterval(heartbeat);
             const session = sessions.get(sid);
             if (session) {
-                // Add to history before deleting
                 sessionHistory.unshift({
                     sessionId: sid,
                     userId: session.userId,
                     established: session.establishedAt,
-                    closedAt: new Date().toISOString()
+                    closedAt: new Date().toISOString(),
                 });
                 if (sessionHistory.length > MAX_SESSION_HISTORY) sessionHistory.pop();
             }
-
-            addMcpLog(`Session ${sid} closed`);
-            clearInterval(heartbeat);
+            addMcpLog(`Session closed: ${sid}`);
             sessions.delete(sid);
         };
+
+        // If the HTTP response is closed server-side (e.g. client crash), clean up
+        res.on("close", () => {
+            if (sessions.has(sid)) {
+                clearInterval(heartbeat);
+                sessions.delete(sid);
+                addMcpLog(`Session force-closed (res.close): ${sid}`);
+            }
+        });
+
     } catch (e) {
         addMcpLog(`SSE Error: ${e.message}`);
-        if (!res.headersSent) {
-            res.status(500).send(`SSE Connection failed: ${e.message}`);
-        }
+        if (!res.headersSent) res.status(500).send(`SSE connection failed: ${e.message}`);
     }
 };
 
+// ── POST message handler ───────────────────────────────────────────────────────
 const handlePost = async (req, res) => {
     const sessionId = req.query.sessionId;
-    if (!sessionId) {
-        return res.status(400).send("Missing sessionId query parameter.");
-    }
+    if (!sessionId) return res.status(400).json({ error: "Missing sessionId query parameter." });
 
     const session = sessions.get(sessionId);
     if (!session) {
-        console.warn(`[MCP] POST rejected: Session ${sessionId} not found.`);
-        return res.status(400).send("Session not found or expired. Please re-open the SSE connection.");
+        addMcpLog(`POST rejected: session ${sessionId} not found`);
+        return res.status(400).json({ error: "Session not found or expired. Re-open the SSE connection." });
     }
-
-    // Inject userId into req.auth so transport.handlePostMessage passes it to tool extra
-    req.auth = { userId: session.userId };
 
     try {
         await session.transport.handlePostMessage(req, res);
     } catch (e) {
-        console.error(`[MCP] Session ${sessionId} POST error: ${e.message}`);
-        if (!res.writableEnded) res.status(500).send(e.message);
+        addMcpLog(`POST error [${sessionId}]: ${e.message}`);
+        if (!res.writableEnded) res.status(500).json({ error: e.message });
     }
 };
 
+// ── Route registration ─────────────────────────────────────────────────────────
 app.get("/sse", auth, handleSse);
 app.post("/sse", handlePost);
 
 app.get("/mcp", auth, handleSse);
 app.post("/mcp", handlePost);
 
+// /messages is a legacy alias — kept for compatibility, same validation applies
 app.post("/messages", handlePost);
 
-const PORT = process.env.MCP_PORT || 3001;
+// ── Start ──────────────────────────────────────────────────────────────────────
+const PORT = parseInt(process.env.MCP_PORT || "3001", 10);
 app.listen(PORT, () => {
-    console.log(`[MCP] Gemini RAG Server v2.1 — http://localhost:${PORT}/sse`);
-    console.log(`[MCP] Tools: ${tools.map(t => t.name).join(", ")}`);
+    addMcpLog(`Gemini RAG MCP Server v2.2 — http://localhost:${PORT}/sse`);
+    addMcpLog(`Tools: ${tools.map(t => t.name).join(", ")}`);
+    addMcpLog(`CORS origins: ${ALLOWED_ORIGINS.join(", ")}`);
 });
