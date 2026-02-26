@@ -149,7 +149,34 @@ export default function ChatTab({ activeStoreId, accessToken }: { activeStoreId:
                                     <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
                                         {m.citations.map((c: any, idx: number) => (
                                             c.uri ? (
-                                                <a key={idx} href={c.uri} target="_blank" rel="noreferrer" className="citation-title">
+                                                <a 
+                                                    key={idx} 
+                                                    href="#" 
+                                                    onClick={async (e) => { 
+                                                        e.preventDefault(); 
+                                                        try {
+                                                            const res = await fetch(c.uri, { headers: authHeaders() });
+                                                            if (!res.ok) {
+                                                                const err = await res.json().catch(() => ({}));
+                                                                alert(`Download failed: ${err.error || res.statusText}`);
+                                                                return;
+                                                            }
+                                                            const blob = await res.blob();
+                                                            const objectUrl = window.URL.createObjectURL(blob);
+                                                            const a = document.createElement("a");
+                                                            a.href = objectUrl;
+                                                            a.download = c.title || "document";
+                                                            document.body.appendChild(a);
+                                                            a.click();
+                                                            a.remove();
+                                                            window.URL.revokeObjectURL(objectUrl);
+                                                        } catch (err) {
+                                                            console.error("Download error:", err);
+                                                            alert("An error occurred while downloading.");
+                                                        }
+                                                    }} 
+                                                    className="citation-title"
+                                                >
                                                     <DocIcon /> {c.title}
                                                 </a>
                                             ) : (
