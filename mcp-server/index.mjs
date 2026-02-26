@@ -559,11 +559,20 @@ function createSessionServer(sessionId) {
     s.setRequestHandler(ListToolsRequestSchema, async () => {
         addMcpLog(`[Session ${sessionId}] Client requested tool list`);
         return {
-            tools: tools.map(t => ({
-                name: t.name,
-                description: t.description,
-                inputSchema: zodToJsonSchema(t.schema)
-            }))
+            tools: tools.map(t => {
+                // Wrap plain object in z.object if it isn't already a Zod schema
+                const zodSchema = (t.schema._def) ? t.schema : z.object(t.schema);
+                const jsonSchema = zodToJsonSchema(zodSchema);
+
+                // Clean up: MCP expects just the schema object, remove $schema/definitions if they exist
+                const { $schema, definitions, ...cleanSchema } = jsonSchema;
+
+                return {
+                    name: t.name,
+                    description: t.description,
+                    inputSchema: cleanSchema
+                };
+            })
         };
     });
 
@@ -576,11 +585,14 @@ function createSessionServer(sessionId) {
 
         try {
             // Manually parse arguments using the Zod schema
-            const args = tool.schema.parse(request.params.arguments || {});
+            const zodSchema = (tool.schema._def) ? tool.schema : z.object(tool.schema);
+            const args = zodSchema.parse(request.params.arguments || {});
             return await tool.handler(args, { transport: { sessionId } });
         } catch (e) {
             addMcpLog(`[Session ${sessionId}] Tool execution failed: ${e.message}`);
-            throw e; // MCP SDK will wrap this in a JSON-RPC error
+            // Use specific error message if it's a Zod validation error
+            const msg = e instanceof z.ZodError ? `Invalid arguments: ${e.message}` : e.message;
+            throw new Error(msg);
         }
     });
 
