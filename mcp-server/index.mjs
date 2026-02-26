@@ -145,16 +145,22 @@ async function ragQuery({ query, storeNames, model = "gemini-2.5-flash", systemP
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
+
+// Internal session Map: sessionId -> { transport, userId }
+const sessions = new Map();
+
 app.use((req, res, next) => {
-    console.log(`[MCP] ${req.method} ${req.url} - headers: ${JSON.stringify(req.headers)}`);
+    // Log incoming requests for debugging (excluding heartbeats/noisy logs if preferred)
+    if (req.url !== "/mcp-status" && req.url !== "/") {
+        console.log(`[MCP] ${req.method} ${req.url}`);
+    }
     next();
 });
+
 app.get("/", (req, res) => res.send("Gemini RAG MCP Server is alive."));
 
-// Per-connection userId store (connection → userId)
-const connectionUsers = new Map(); // transportId → userId
 
-// Auth middleware
+// ── Auth middleware ───────────────────────────────────────────────────────────
 const auth = async (req, res, next) => {
     let token = "";
     const header = req.headers.authorization;
@@ -165,46 +171,41 @@ const auth = async (req, res, next) => {
     }
 
     if (!token) {
-        console.warn(`[MCP] Rejecting connection: Missing token`);
         return res.status(401).json({ error: "Missing token. Use Bearer header or ?token= query param." });
     }
 
     const { userId, valid } = await resolveUser(token);
     if (!valid) {
-        console.warn(`[MCP] Rejecting connection: Invalid token ${token.slice(0, 8)}...`);
         return res.status(403).json({ error: "Invalid or inactive MCP API key." });
     }
-    console.log(`[MCP] Auth success for user ${userId}`);
     req.userId = userId;
     next();
 };
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
-const server = new McpServer({ name: "gemini-rag", version: "2.0.0" });
-
-// userId is resolved per-connection and stored in connectionUsers.
-// Each tool reads it via the module-level currentUserId (safe for SSE: 1 connection = 1 user at a time).
-let currentUserId = null;
-let transport = null;
+const server = new McpServer({ name: "gemini-rag", version: "2.1.0" });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. chat  ▸ The primary tool — chat with documents in the active store
+// 1. chat  ▸ The primary tool
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
     "chat",
-    "Chat with your documents. Asks a question and gets an answer grounded in your uploaded files. Uses your active store by default.",
+    "Chat with your documents. Asks a question and gets an answer grounded in your uploaded files.",
     {
         message: z.string().describe("Your question or message to answer using the documents"),
         storeId: z.string().optional().describe("Store ID to search. Omit to use your active store."),
         model: z.string().optional().describe("Gemini model (default: gemini-2.5-flash)"),
     },
-    async ({ message, storeId, model }) => {
+    async ({ message, storeId, model }, extra) => {
+        const userId = extra?.authInfo?.userId;
+        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+
         try {
-            const settings = await getUserSettings(currentUserId);
+            const settings = await getUserSettings(userId);
             const resolvedStoreId = storeId || settings?.active_store_id;
 
             if (!resolvedStoreId) {
-                return { content: [{ type: "text", text: "⚠️ No active store set. Use set_active_store first, or select a store in the Gemini RAG UI." }] };
+                return { content: [{ type: "text", text: "⚠️ No active store set. Use set_active_store first." }] };
             }
 
             const storeName = toStoreName(resolvedStoreId);
@@ -223,26 +224,26 @@ server.tool(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. chat_with_store  ▸ Same as chat but storeId is required
+// 2. chat_with_store
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
     "chat_with_store",
     "Chat with documents in a specific store by its ID or display name.",
     {
         message: z.string().describe("Your question or message"),
-        storeId: z.string().describe("Store ID or display name (e.g. 'My Docs' or 'koko-abc123')"),
-        model: z.string().optional().describe("Gemini model (default: gemini-2.5-flash)"),
+        storeId: z.string().describe("Store ID or display name"),
+        model: z.string().optional().describe("Gemini model"),
     },
-    async ({ message, storeId, model }) => {
+    async ({ message, storeId, model }, extra) => {
+        const userId = extra?.authInfo?.userId;
+        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+
         try {
             const stores = await getAllStores();
             const store = await findStore(storeId, stores);
-            if (!store) {
-                const names = stores.map(s => `• ${s.displayName} (${s.id})`).join("\n");
-                return { content: [{ type: "text", text: `Store "${storeId}" not found.\n\nAvailable stores:\n${names}` }] };
-            }
+            if (!store) return { content: [{ type: "text", text: `Store "${storeId}" not found.` }] };
 
-            const settings = await getUserSettings(currentUserId);
+            const settings = await getUserSettings(userId);
             const answer = await ragQuery({
                 query: message,
                 storeNames: [store.name],
@@ -258,23 +259,24 @@ server.tool(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. chat_all_stores  ▸ Search across ALL stores at once
+// 3. chat_all_stores
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
     "chat_all_stores",
     "Ask a question and search across ALL of your document stores simultaneously.",
     {
         message: z.string().describe("Your question or message"),
-        model: z.string().optional().describe("Gemini model (default: gemini-2.5-flash)"),
+        model: z.string().optional().describe("Gemini model"),
     },
-    async ({ message, model }) => {
+    async ({ message, model }, extra) => {
+        const userId = extra?.authInfo?.userId;
+        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+
         try {
             const stores = await getAllStores();
-            if (!stores.length) {
-                return { content: [{ type: "text", text: "No stores found. Upload documents first." }] };
-            }
+            if (!stores.length) return { content: [{ type: "text", text: "No stores found." }] };
 
-            const settings = await getUserSettings(currentUserId);
+            const settings = await getUserSettings(userId);
             const answer = await ragQuery({
                 query: message,
                 storeNames: stores.map(s => s.name),
@@ -290,18 +292,21 @@ server.tool(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. list_stores  ▸ Show all available stores
+// 4. list_stores
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
     "list_stores",
     "List all available document stores with their IDs and names.",
     {},
-    async () => {
+    async (_, extra) => {
+        const userId = extra?.authInfo?.userId;
+        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+
         try {
             const stores = await getAllStores();
             if (!stores.length) return { content: [{ type: "text", text: "No stores found." }] };
 
-            const settings = await getUserSettings(currentUserId);
+            const settings = await getUserSettings(userId);
             const activeId = settings?.active_store_id;
 
             const lines = stores.map(s =>
@@ -315,20 +320,21 @@ server.tool(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. get_active_store  ▸ Which store is currently selected?
+// 5. get_active_store
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
     "get_active_store",
-    "Returns the currently active document store (the one used by default when you call chat).",
+    "Returns the currently active document store.",
     {},
-    async () => {
+    async (_, extra) => {
+        const userId = extra?.authInfo?.userId;
+        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+
         try {
-            const settings = await getUserSettings(currentUserId);
-            if (!settings?.active_store_id) {
-                return { content: [{ type: "text", text: "No active store set. Use set_active_store to choose one." }] };
-            }
+            const settings = await getUserSettings(userId);
+            if (!settings?.active_store_id) return { content: [{ type: "text", text: "No active store set." }] };
             const stores = await getAllStores();
-            const store = stores.find(s => s.id === settings.active_store_id || s.name === settings.active_store_id);
+            const store = stores.find(s => s.id === settings.active_store_id);
             return {
                 content: [{
                     type: "text",
@@ -342,24 +348,22 @@ server.tool(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. set_active_store  ▸ Switch which store to use
+// 6. set_active_store
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
     "set_active_store",
-    "Set the active document store. Changes take effect immediately and sync with the Gemini RAG UI.",
-    {
-        storeId: z.string().describe("Store ID or display name (partial match supported)"),
-    },
-    async ({ storeId }) => {
+    "Set the active document store.",
+    { storeId: z.string().describe("Store ID or display name") },
+    async ({ storeId }, extra) => {
+        const userId = extra?.authInfo?.userId;
+        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+
         try {
             const stores = await getAllStores();
             const store = await findStore(storeId, stores);
-            if (!store) {
-                const names = stores.map(s => `• ${s.displayName} (${s.id})`).join("\n");
-                return { content: [{ type: "text", text: `Store "${storeId}" not found.\n\nAvailable:\n${names}` }] };
-            }
-            await setActiveStore(currentUserId, store.id);
-            return { content: [{ type: "text", text: `✅ Active store set to: ${store.displayName} (${store.id})` }] };
+            if (!store) return { content: [{ type: "text", text: `Store "${storeId}" not found.` }] };
+            await setActiveStore(userId, store.id);
+            return { content: [{ type: "text", text: `✅ Active store set to: ${store.displayName}` }] };
         } catch (e) {
             return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
         }
@@ -367,26 +371,29 @@ server.tool(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7. list_documents  ▸ See what files are in a store
+// 7. list_documents
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
     "list_documents",
-    "List the documents/files uploaded to a store. Uses the active store if storeId is not provided.",
+    "List the documents/files uploaded to a store.",
     {
         storeId: z.string().optional().describe("Store ID. Uses the active store if omitted."),
         limit: z.number().optional().describe("Max results (default 50)"),
     },
-    async ({ storeId, limit }) => {
+    async ({ storeId, limit }, extra) => {
+        const userId = extra?.authInfo?.userId;
+        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+
         try {
-            const settings = await getUserSettings(currentUserId);
+            const settings = await getUserSettings(userId);
             const resolvedId = storeId || settings?.active_store_id;
             if (!resolvedId) return { content: [{ type: "text", text: "No storeId and no active store is set." }] };
 
             const storeName = toStoreName(resolvedId);
             const docs = await getStoreDocuments(storeName, limit || 50);
-            if (!docs.length) return { content: [{ type: "text", text: `No documents in store "${resolvedId}".` }] };
+            if (!docs.length) return { content: [{ type: "text", text: `No documents in store.` }] };
 
-            const lines = docs.map((d, i) => `${i + 1}. ${d.displayName} (${d.state})\n   ID: ${d.id}`);
+            const lines = docs.map((d, i) => `${i + 1}. ${d.displayName}\n   ID: ${d.id}`);
             return { content: [{ type: "text", text: `${docs.length} document(s):\n\n${lines.join("\n\n")}` }] };
         } catch (e) {
             return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
@@ -395,27 +402,27 @@ server.tool(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. summarize  ▸ Ask for a summary of all documents in a store
+// 8. summarize
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
     "summarize",
-    "Generate a summary of all documents in a store. Uses the active store if storeId is not provided.",
+    "Generate a summary of all documents in a store.",
     {
-        storeId: z.string().optional().describe("Store ID. Uses the active store if omitted."),
-        focus: z.string().optional().describe("Optional: specific topic or aspect to focus the summary on"),
-        model: z.string().optional().describe("Gemini model (default: gemini-2.5-flash)"),
+        storeId: z.string().optional().describe("Store ID."),
+        focus: z.string().optional().describe("Optional topic to focus on"),
+        model: z.string().optional().describe("Gemini model"),
     },
-    async ({ storeId, focus, model }) => {
+    async ({ storeId, focus, model }, extra) => {
+        const userId = extra?.authInfo?.userId;
+        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+
         try {
-            const settings = await getUserSettings(currentUserId);
+            const settings = await getUserSettings(userId);
             const resolvedId = storeId || settings?.active_store_id;
             if (!resolvedId) return { content: [{ type: "text", text: "No active store set." }] };
 
             const storeName = toStoreName(resolvedId);
-            const prompt = focus
-                ? `Please provide a detailed summary of all documents, focusing specifically on: ${focus}`
-                : "Please provide a comprehensive summary of all the documents in this store. Include the main topics, key points, and important details.";
-
+            const prompt = focus ? `Summary focus: ${focus}` : "Comprehensive summary.";
             const answer = await ragQuery({
                 query: prompt,
                 storeNames: [storeName],
@@ -430,22 +437,25 @@ server.tool(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 9. delete_document  ▸ Remove a file from a store
+// 9. delete_document
 // ─────────────────────────────────────────────────────────────────────────────
 server.tool(
     "delete_document",
-    "Permanently delete a document from a store. This cannot be undone.",
+    "Permanently delete a document from a store.",
     {
-        documentId: z.string().describe("Document ID or full document name"),
-        storeId: z.string().optional().describe("Store ID (uses active store if omitted)"),
+        documentId: z.string().describe("Document ID"),
+        storeId: z.string().optional().describe("Store ID"),
     },
-    async ({ documentId, storeId }) => {
+    async ({ documentId, storeId }, extra) => {
+        const userId = extra?.authInfo?.userId;
+        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+
         try {
-            const settings = await getUserSettings(currentUserId);
+            const settings = await getUserSettings(userId);
             const resolvedId = storeId || settings?.active_store_id;
             let docName = documentId;
             if (!docName.includes("/")) {
-                if (!resolvedId) return { content: [{ type: "text", text: "Cannot resolve document without a storeId or active store." }] };
+                if (!resolvedId) return { content: [{ type: "text", text: "Store ID required." }] };
                 docName = `${toStoreName(resolvedId)}/documents/${documentId}`;
             }
             await ai.fileSearchStores.documents.delete({ name: docName });
@@ -457,68 +467,81 @@ server.tool(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 10. help  ▸ Show available tools
+// 10. help
 // ─────────────────────────────────────────────────────────────────────────────
-server.tool(
-    "help",
-    "List all available tools and how to use this MCP server.",
-    {},
-    async () => ({
-        content: [{
-            type: "text",
-            text: `Gemini RAG MCP Server v2.0
-═══════════════════════════
+server.tool("help", "Show help.", {}, async () => ({
+    content: [{ type: "text", text: `Gemini RAG MCP v2.1\nUse chat, list_stores, etc.` }]
+}));
 
-Primary tools (chat with your documents):
-  chat              — Ask a question using your active store (recommended)
-  chat_with_store   — Ask using a specific store by ID or name
-  chat_all_stores   — Search across ALL stores simultaneously
-  summarize         — Get a summary of all documents in a store
-
-Store management:
-  list_stores       — See all available stores (★ marks the active one)
-  get_active_store  — Show which store is currently active
-  set_active_store  — Switch the active store (syncs with the UI)
-
-Document management:
-  list_documents    — List files in a store
-  delete_document   — Permanently delete a document
-
-  help              — This message
-
-Tip: Start with list_stores, then call chat to ask questions.`
-        }]
-    })
-);
+// ── SSE transport handling (Session-aware) ────────────────────────────────────
 
 const handleSse = async (req, res) => {
-    currentUserId = req.userId;
-    const endpoint = req.url.split('?')[0]; // e.g. /sse or /mcp
-    console.log(`[MCP] SSE connected at ${endpoint} (userId: ${currentUserId || "dev-mode"})`);
-    transport = new SSEServerTransport(endpoint, res);
+    const userId = req.userId;
+    const endpoint = req.path; // e.g. /sse or /mcp
+
+    // Proactive headers to combat proxy buffering/timeouts
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const transport = new SSEServerTransport(endpoint, res);
     await server.connect(transport);
+
+    const sid = transport.sessionId;
+    sessions.set(sid, { transport, userId });
+
+    console.log(`[MCP] Session ${sid} established for user ${userId} at ${endpoint}`);
+
+    // 15s Heartbeat to keep the connection alive through Nginx/Traefik
+    const heartbeat = setInterval(() => {
+        if (!res.writableEnded) {
+            res.write(': heartbeat\n\n');
+        } else {
+            clearInterval(heartbeat);
+        }
+    }, 15000);
+
+    transport.onclose = () => {
+        console.log(`[MCP] Session ${sid} closed`);
+        clearInterval(heartbeat);
+        sessions.delete(sid);
+    };
 };
 
 const handlePost = async (req, res) => {
-    if (!transport) {
-        console.warn(`[MCP] POST rejected: No active SSE connection for ${req.url}`);
-        return res.status(400).send("No active SSE connection. Connect via GET /sse first.");
+    const sessionId = req.query.sessionId;
+    if (!sessionId) {
+        return res.status(400).send("Missing sessionId query parameter.");
     }
-    currentUserId = req.userId;
-    console.log(`[MCP] POST message received at ${req.url}`);
-    await transport.handlePostMessage(req, res);
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+        console.warn(`[MCP] POST rejected: Session ${sessionId} not found.`);
+        return res.status(400).send("Session not found or expired. Please re-open the SSE connection.");
+    }
+
+    // Inject userId into req.auth so transport.handlePostMessage passes it to tool extra
+    req.auth = { userId: session.userId };
+
+    try {
+        await session.transport.handlePostMessage(req, res);
+    } catch (e) {
+        console.error(`[MCP] Session ${sessionId} POST error: ${e.message}`);
+        if (!res.writableEnded) res.status(500).send(e.message);
+    }
 };
 
 app.get("/sse", auth, handleSse);
-app.post("/sse", auth, express.json(), handlePost);
+app.post("/sse", express.json(), handlePost); // No 'auth' on POST because sessionId is the secret
 
 app.get("/mcp", auth, handleSse);
-app.post("/mcp", auth, express.json(), handlePost);
+app.post("/mcp", express.json(), handlePost);
 
-app.post("/messages", auth, express.json(), handlePost);
+app.post("/messages", express.json(), handlePost);
 
 const PORT = process.env.MCP_PORT || 3001;
 app.listen(PORT, () => {
-    console.log(`[MCP] Gemini RAG Server v2.0 — http://localhost:${PORT}/sse`);
+    console.log(`[MCP] Gemini RAG Server v2.1 — http://localhost:${PORT}/sse`);
     console.log(`[MCP] Tools: chat, chat_with_store, chat_all_stores, summarize, list_stores, get_active_store, set_active_store, list_documents, delete_document, help`);
 });
