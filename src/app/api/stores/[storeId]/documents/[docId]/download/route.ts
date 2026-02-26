@@ -58,11 +58,13 @@ export async function GET(
         let userId: string | null = null;
         let accessToken: string | undefined;
         let useAdmin = false;
+        let authMethod = "none";
 
         const jwtUser = (await getAuthUser(req)) || (await getAuthUserFromCookie(req.headers.get("cookie")));
         if (jwtUser) {
             userId = jwtUser.id;
             accessToken = jwtUser.accessToken;
+            authMethod = "jwt";
         }
 
         // 2. Fallback: accept MCP API key as ?token= or Bearer header.
@@ -77,6 +79,7 @@ export async function GET(
             if (mcpUser) {
                 userId = mcpUser.id;
                 useAdmin = true; // No Supabase JWT — use admin client for document query
+                authMethod = "mcp-key";
             }
         }
 
@@ -86,13 +89,22 @@ export async function GET(
 
         const { storeId, docId } = await params;
 
+        console.log(`[Download] auth=${authMethod} userId=${userId} docId=${docId} storeId=${storeId} useAdmin=${useAdmin} hasServiceKey=${!!process.env.SUPABASE_SERVICE_ROLE_KEY}`);
+
         // Use admin client for MCP-key auth (bypasses RLS), JWT client otherwise
         const doc = useAdmin
             ? await getDocumentAdmin(userId, docId)
             : await getDocument(userId, docId, accessToken);
 
         if (!doc) {
-            return NextResponse.json({ error: "Document not found in database", docId, storeId }, { status: 404 });
+            console.error(`[Download] Document not found: userId=${userId} docId=${docId} auth=${authMethod} useAdmin=${useAdmin}`);
+            return NextResponse.json({
+                error: "Document not found in database",
+                docId,
+                storeId,
+                authMethod,
+                hasServiceKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+            }, { status: 404 });
         }
 
         if (!doc.localPath) {

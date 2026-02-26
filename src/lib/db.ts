@@ -43,7 +43,7 @@ export async function deleteStoreDB(userId: string, storeId: string, accessToken
 
 export async function getDocuments(userId: string, storeId?: string, accessToken?: string, limit?: number, offset?: number) {
     const sb = getSupabaseServer(accessToken);
-    let q = sb.from("documents").select("*", { count: 'exact' }).eq("user_id", userId);
+    let q = sb.from("documents").select("*", { count: 'exact' }).eq("user_id", userId).is("deleted_at", null);
     if (storeId) q = q.eq("store_id", storeId);
 
     let query = q.order("uploaded_at", { ascending: false });
@@ -80,6 +80,7 @@ export async function getDocument(userId: string, docId: string, accessToken?: s
         .select("*")
         .eq("user_id", userId)
         .eq("id", docId)
+        .is("deleted_at", null)
         .single();
     if (error) return null;
     return {
@@ -105,6 +106,7 @@ export async function getDocumentAdmin(userId: string, docId: string): Promise<D
         .select("*")
         .eq("user_id", userId)
         .eq("id", docId)
+        .is("deleted_at", null)
         .single();
     if (error) return null;
     return {
