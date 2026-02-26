@@ -168,9 +168,24 @@ async function ragQuery({ query, storeNames, model = "gemini-2.5-flash", systemP
     const grounding = response.candidates?.[0]?.groundingMetadata;
     if (grounding?.groundingChunks?.length) {
         text += "\n\nSources:";
-        grounding.groundingChunks.forEach((chunk, i) => {
-            if (chunk.web?.title || chunk.web?.uri) {
-                text += `\n[${i + 1}] ${chunk.web.title || chunk.web.uri}`;
+        const sourcesSeen = new Set();
+
+        grounding.groundingChunks.forEach((chunk) => {
+            // Web Search
+            if (chunk.web?.uri) {
+                const label = chunk.web.title || chunk.web.uri;
+                if (!sourcesSeen.has(chunk.web.uri)) {
+                    text += `\n- ${label} (${chunk.web.uri})`;
+                    sourcesSeen.add(chunk.web.uri);
+                }
+            }
+            // File Search (RAG)
+            else if (chunk.retrievedContext?.uri) {
+                const label = chunk.retrievedContext.title || chunk.retrievedContext.uri.split("/").pop();
+                if (!sourcesSeen.has(chunk.retrievedContext.uri)) {
+                    text += `\n- ${label} (ID: ${chunk.retrievedContext.uri.split("/").pop()})`;
+                    sourcesSeen.add(chunk.retrievedContext.uri);
+                }
             }
         });
     }
@@ -567,10 +582,10 @@ registerTool(
 // ─────────────────────────────────────────────────────────────────────────────
 registerTool(
     "get_document_link",
-    "Generates links to view or download a document.",
+    "Generates links to view or download a document. Accepts names or IDs.",
     {
-        documentId: z.string().describe("Document ID (e.g. documents/123)"),
-        storeId: z.string().optional().describe("Store ID. Uses active store if omitted."),
+        documentId: z.string().describe("Document ID or name"),
+        storeId: z.string().optional().describe("Store ID or name. Uses active store if omitted."),
     },
     async ({ documentId, storeId }, extra) => {
         const userId = resolveUserIdFromExtra(extra);
@@ -578,14 +593,40 @@ registerTool(
 
         try {
             const settings = await getUserSettings(userId);
-            const resolvedId = storeId || settings?.active_store_id;
-            if (!resolvedId) return { content: [{ type: "text", text: "Store ID required." }] };
+            const stores = await getAllStores();
 
-            // Strip prefix if present (e.g. "documents/123" -> "123")
-            const cleanDocId = documentId.split("/").pop();
+            // 1. Resolve Store
+            let store = null;
+            if (storeId) {
+                store = await findStore(storeId, stores);
+            } else if (settings?.active_store_id) {
+                store = stores.find(s => s.id === settings.active_store_id);
+            }
 
-            const viewUrl = `${APP_URL}/?tab=docs&storeId=${resolvedId}&docId=${cleanDocId}`;
-            const downloadUrl = `${APP_URL}/api/stores/${resolvedId}/documents/${cleanDocId}/download`;
+            if (!store) {
+                return { content: [{ type: "text", text: `Error: Could not resolve store "${storeId || 'active'}"` }] };
+            }
+
+            const activeStoreName = store.name; // full name
+            const activeStoreId = store.id;   // short ID
+
+            // 2. Resolve Document
+            const docs = await getStoreDocuments(activeStoreName, 100);
+            const q = documentId.toLowerCase();
+            const qClean = q.split("/").pop();
+
+            // Try exact ID match first, then exact display name, then substring
+            let doc = docs.find(d => d.id.toLowerCase() === q || d.id.toLowerCase() === qClean) ||
+                docs.find(d => d.displayName.toLowerCase() === q || d.displayName.toLowerCase() === qClean) ||
+                docs.find(d => d.displayName.toLowerCase().includes(qClean));
+
+            if (!doc) {
+                return { content: [{ type: "text", text: `Error: Could not find document "${documentId}" in store "${store.displayName}"` }] };
+            }
+
+            const cleanDocId = doc.id;
+            const viewUrl = `${APP_URL}/?tab=docs&storeId=${activeStoreId}&docId=${cleanDocId}`;
+            const downloadUrl = `${APP_URL}/api/stores/${activeStoreId}/documents/${cleanDocId}/download`;
 
             return {
                 content: [{
@@ -757,5 +798,5 @@ app.post("/messages", handlePost);
 const PORT = process.env.MCP_PORT || 3001;
 app.listen(PORT, () => {
     console.log(`[MCP] Gemini RAG Server v2.1 — http://localhost:${PORT}/sse`);
-    console.log(`[MCP] Tools: chat, chat_with_store, chat_all_stores, summarize, list_stores, get_active_store, set_active_store, list_documents, delete_document, help`);
+    console.log(`[MCP] Tools: ${tools.map(t => t.name).join(", ")}`);
 });
