@@ -662,12 +662,12 @@ const handlePost = async (req, res) => {
 };
 
 app.get("/sse", auth, handleSse);
-app.post("/sse", express.json(), handlePost); // No 'auth' on POST because sessionId is the secret
+app.post("/sse", handlePost);
 
 app.get("/mcp", auth, handleSse);
-app.post("/mcp", express.json(), handlePost);
+app.post("/mcp", handlePost);
 
-app.post("/messages", express.json(), handlePost);
+app.post("/messages", handlePost);
 
 const PORT = process.env.MCP_PORT || 3001;
 app.listen(PORT, () => {
