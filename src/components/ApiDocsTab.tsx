@@ -352,11 +352,11 @@ export default function ApiDocsTab() {
                                     <div key={idx} style={{ padding: "0.6rem 0.75rem", borderRadius: "8px", background: "rgba(255,255,255,0.02)", marginBottom: "0.4rem", border: "1px solid rgba(255,255,255,0.05)" }}>
                                         <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", marginBottom: "0.2rem", display: "flex", justifyContent: "space-between" }}>
                                             <span>Session ID:</span>
-                                            <span style={{ fontFamily: "monospace", color: "var(--text-secondary)" }}>{s.sessionId.slice(0, 8)}...</span>
+                                            <span style={{ fontFamily: "monospace", color: "var(--text-secondary)" }}>{s.sessionId?.slice(0, 8) || "unknown"}...</span>
                                         </div>
                                         <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", display: "flex", justifyContent: "space-between" }}>
                                             <span>Connected:</span>
-                                            <span style={{ color: "var(--text-secondary)" }}>{new Date(s.established).toLocaleTimeString()}</span>
+                                            <span style={{ color: "var(--text-secondary)" }}>{s.established ? new Date(s.established).toLocaleTimeString() : "unknown"}</span>
                                         </div>
                                     </div>
                                 ))
@@ -366,8 +366,29 @@ export default function ApiDocsTab() {
 
                     {/* Server Logs */}
                     <div style={{ background: "rgba(0,0,0,0.15)", borderRadius: "12px", border: "1px solid var(--border-color)", overflow: "hidden" }}>
-                        <div style={{ padding: "0.75rem 1rem", borderBottom: "1px solid var(--border-color)", background: "rgba(255,255,255,0.03)", fontSize: "0.8rem", fontWeight: 600 }}>
-                            Recent Server Activity
+                        <div style={{
+                            padding: "0.75rem 1rem", borderBottom: "1px solid var(--border-color)",
+                            background: "rgba(255,255,255,0.03)", fontSize: "0.8rem", fontWeight: 600,
+                            display: "flex", justifyContent: "space-between", alignItems: "center"
+                        }}>
+                            <span>Recent Server Activity</span>
+                            <button
+                                onClick={async () => {
+                                    try {
+                                        await fetch("/api/mcp-logs/clear", { method: "POST" });
+                                        setMcpStatus(prev => ({ ...prev, logs: [] }));
+                                    } catch { }
+                                }}
+                                style={{
+                                    background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)",
+                                    borderRadius: "4px", padding: "2px 8px", color: "var(--text-muted)",
+                                    fontSize: "0.65rem", cursor: "pointer", transition: "all 0.2s"
+                                }}
+                                onMouseEnter={(e) => { (e.currentTarget as any).style.background = "rgba(239, 68, 68, 0.1)"; (e.currentTarget as any).style.color = "#f87171"; }}
+                                onMouseLeave={(e) => { (e.currentTarget as any).style.background = "rgba(255,255,255,0.05)"; (e.currentTarget as any).style.color = "var(--text-muted)"; }}
+                            >
+                                Clear
+                            </button>
                         </div>
                         <div style={{ maxHeight: "250px", overflowY: "auto", padding: "0.5rem", fontFamily: "monospace", fontSize: "0.75rem" }}>
                             {mcpStatus.logs.length === 0 ? (

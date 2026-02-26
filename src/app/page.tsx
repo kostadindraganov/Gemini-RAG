@@ -61,6 +61,13 @@ export default function Home() {
             if (session) fetchStores(session);
         });
 
+        // Deep linking: switch tab if ?tab= provided
+        const params = new URLSearchParams(window.location.search);
+        const tab = params.get("tab");
+        if (tab === "docs" || tab === "stores" || tab === "api" || tab === "settings") {
+            setActiveTab(tab as Tab);
+        }
+
         return () => subscription.unsubscribe();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);

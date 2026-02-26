@@ -22,6 +22,7 @@ if (fs.existsSync(".env.local")) {
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "https://rag.kokoit.com";
 
 if (!GEMINI_API_KEY) { console.error("[MCP] GEMINI_API_KEY not set"); process.exit(1); }
 
@@ -160,7 +161,21 @@ async function ragQuery({ query, storeNames, model = "gemini-2.5-flash", systemP
         contents,
         config,
     });
-    return response.text || "(No response)";
+
+    let text = response.text || "(No response)";
+
+    // Append citations if available
+    const grounding = response.candidates?.[0]?.groundingMetadata;
+    if (grounding?.groundingChunks?.length) {
+        text += "\n\nSources:";
+        grounding.groundingChunks.forEach((chunk, i) => {
+            if (chunk.web?.title || chunk.web?.uri) {
+                text += `\n[${i + 1}] ${chunk.web.title || chunk.web.uri}`;
+            }
+        });
+    }
+
+    return text;
 }
 
 // ── Express app ───────────────────────────────────────────────────────────────
@@ -206,6 +221,12 @@ app.get("/api/mcp-status", (req, res) => {
         sessions: activeSessions,
         logs: mcpLogs
     });
+});
+
+app.post("/api/mcp-logs/clear", (req, res) => {
+    mcpLogs.length = 0;
+    addMcpLog("Logs cleared by user.");
+    res.json({ success: true });
 });
 
 
@@ -532,6 +553,39 @@ registerTool(
             }
             await ai.fileSearchStores.documents.delete({ name: docName });
             return { content: [{ type: "text", text: `✅ Deleted: ${docName}` }] };
+        } catch (e) {
+            return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
+        }
+    }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. get_document_link
+// ─────────────────────────────────────────────────────────────────────────────
+registerTool(
+    "get_document_link",
+    "Generates a link to view a document in the web interface.",
+    {
+        documentId: z.string().describe("Document ID"),
+        storeId: z.string().optional().describe("Store ID"),
+    },
+    async ({ documentId, storeId }, extra) => {
+        const userId = resolveUserIdFromExtra(extra);
+        if (!userId) return { content: [{ type: "text", text: "Error: No user session found." }] };
+
+        try {
+            const settings = await getUserSettings(userId);
+            const resolvedId = storeId || settings?.active_store_id;
+            if (!resolvedId) return { content: [{ type: "text", text: "Store ID required." }] };
+
+            // Construct link to the docs tab
+            const url = `${APP_URL}/?tab=docs&storeId=${resolvedId}&docId=${documentId}`;
+            return {
+                content: [{
+                    type: "text",
+                    text: `View document here: ${url}`
+                }]
+            };
         } catch (e) {
             return { content: [{ type: "text", text: `Error: ${e?.message || e}` }] };
         }
