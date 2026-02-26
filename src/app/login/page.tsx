@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { supabase } from "@/lib/supabase";
 
 export default function LoginPage() {
@@ -10,6 +10,22 @@ export default function LoginPage() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
     const [success, setSuccess] = useState("");
+    const [registrationLocked, setRegistrationLocked] = useState(false);
+
+    useEffect(() => {
+        const checkLock = async () => {
+            try {
+                const res = await fetch("/api/system-config");
+                const data = await res.json();
+                if (data.registrationLocked) {
+                    setRegistrationLocked(true);
+                }
+            } catch (e) {
+                console.error("Failed to check registration lock", e);
+            }
+        };
+        checkLock();
+    }, []);
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -19,6 +35,9 @@ export default function LoginPage() {
 
         try {
             if (isSignUp) {
+                if (registrationLocked) {
+                    throw new Error("Registration is currently locked by the administrator.");
+                }
                 const { error } = await supabase.auth.signUp({ email, password });
                 if (error) throw error;
                 setSuccess("Account created! You can now sign in.");
@@ -76,7 +95,7 @@ export default function LoginPage() {
                             Welcome to Gemini RAG
                         </h1>
                         <p style={{ color: "var(--text-secondary)", marginTop: "0.5rem", fontSize: "0.95rem" }}>
-                            {isSignUp ? "Create an account to get started" : "Sign in to access your knowledge base"}
+                            {isSignUp ? (registrationLocked ? "Account creation is disabled" : "Create an account to get started") : "Sign in to access your knowledge base"}
                         </p>
                     </div>
                 </div>
@@ -154,7 +173,7 @@ export default function LoginPage() {
                     <button
                         type="submit"
                         className="btn-primary"
-                        disabled={loading || !email || !password}
+                        disabled={loading || !email || !password || (isSignUp && registrationLocked)}
                         style={{ width: "100%", padding: "0.85rem", fontSize: "1rem", marginTop: "0.5rem" }}
                     >
                         {loading ? (
@@ -167,28 +186,38 @@ export default function LoginPage() {
                     </button>
                 </form>
 
-                <div style={{ textAlign: "center", borderTop: "1px solid var(--border-color)", paddingTop: "1.5rem" }}>
-                    <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem" }}>
-                        {isSignUp ? "Already have an account?" : "Don't have an account?"}&nbsp;
-                        <button
-                            onClick={() => { setIsSignUp(!isSignUp); setError(""); setSuccess(""); }}
-                            style={{
-                                background: "none",
-                                border: "none",
-                                color: "var(--text-primary)",
-                                fontWeight: 600,
-                                cursor: "pointer",
-                                fontSize: "0.95rem",
-                                padding: "0.25rem",
-                                transition: "text-shadow 0.2s"
-                            }}
-                            onMouseOver={e => e.currentTarget.style.textShadow = "0 0 10px rgba(255,255,255,0.3)"}
-                            onMouseOut={e => e.currentTarget.style.textShadow = "none"}
-                        >
-                            {isSignUp ? "Sign in" : "Sign up"}
-                        </button>
-                    </p>
-                </div>
+                {!registrationLocked && (
+                    <div style={{ textAlign: "center", borderTop: "1px solid var(--border-color)", paddingTop: "1.5rem" }}>
+                        <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem" }}>
+                            {isSignUp ? "Already have an account?" : "Don't have an account?"}&nbsp;
+                            <button
+                                onClick={() => { setIsSignUp(!isSignUp); setError(""); setSuccess(""); }}
+                                style={{
+                                    background: "none",
+                                    border: "none",
+                                    color: "var(--text-primary)",
+                                    fontWeight: 600,
+                                    cursor: "pointer",
+                                    fontSize: "0.95rem",
+                                    padding: "0.25rem",
+                                    transition: "text-shadow 0.2s"
+                                }}
+                                onMouseOver={e => e.currentTarget.style.textShadow = "0 0 10px rgba(255,255,255,0.3)"}
+                                onMouseOut={e => e.currentTarget.style.textShadow = "none"}
+                            >
+                                {isSignUp ? "Sign in" : "Sign up"}
+                            </button>
+                        </p>
+                    </div>
+                )}
+
+                {registrationLocked && !isSignUp && (
+                    <div style={{ textAlign: "center", borderTop: "1px solid var(--border-color)", paddingTop: "1.5rem" }}>
+                        <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+                            Registration is currently closed.
+                        </p>
+                    </div>
+                )}
             </div>
         </div>
     );

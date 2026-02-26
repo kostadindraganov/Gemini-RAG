@@ -351,6 +351,43 @@ export async function validateMcpKey(keyValue: string): Promise<boolean> {
     return true;
 }
 
+// ==================== SYSTEM CONFIG ====================
+
+export async function getRegistrationLock(accessToken?: string): Promise<boolean> {
+    const sb = getSupabaseServer(accessToken);
+    const { data, error } = await sb
+        .from("system_config")
+        .select("value")
+        .eq("key", "registration_locked")
+        .single();
+
+    if (error) {
+        console.error("Failed to fetch registration lock", error);
+        return false;
+    }
+    return data.value === true;
+}
+
+export async function toggleRegistrationLock(locked: boolean, accessToken: string) {
+    const sb = getSupabaseServer(accessToken);
+    const { error } = await sb
+        .from("system_config")
+        .update({ value: locked, updated_at: new Date().toISOString() })
+        .eq("key", "registration_locked");
+    if (error) throw error;
+}
+
+export async function getUserCount(): Promise<number> {
+    const sb = getSupabaseServer(); // Use anon key, calling a security definer function
+    const { data, error } = await sb.rpc("get_registered_user_count");
+
+    if (error) {
+        console.error("Error fetching user count via RPC", error);
+        return 0;
+    }
+    return data?.[0]?.count || 0;
+}
+
 // ==================== HELPER: Get auth user from request ====================
 
 export async function getAuthUser(req: Request) {

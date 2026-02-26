@@ -118,6 +118,10 @@ export default function SettingsTab({ accessToken, accountTier, onTierChange }: 
         "Content-Type": "application/json"
     });
 
+    const [registrationLocked, setRegistrationLocked] = useState(false);
+    const [userCount, setUserCount] = useState(0);
+    const [isUpdatingConfig, setIsUpdatingConfig] = useState(false);
+
     useEffect(() => {
         const defaultUrl = window.location.protocol + "//" + window.location.hostname + ":3001/sse";
         setMcpUrl(defaultUrl);
@@ -126,8 +130,53 @@ export default function SettingsTab({ accessToken, accountTier, onTierChange }: 
         fetchMcpKeys();
         fetchMcpEndpoints();
         fetchAccountTier();
+        fetchSystemConfig();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    const fetchSystemConfig = async () => {
+        try {
+            const res = await fetch("/api/system-config", { headers: headers() });
+            const data = await res.json();
+            setRegistrationLocked(data.registrationLocked);
+            setUserCount(data.userCount);
+        } catch (e) {
+            console.error("Failed to fetch system config", e);
+        }
+    };
+
+    const handleToggleRegistration = async () => {
+        if (isUpdatingConfig) return;
+
+        // Safety check
+        if (!registrationLocked && userCount === 0) {
+            setMessage("Cannot lock registration: No users are currently registered.");
+            setTimeout(() => setMessage(""), 3000);
+            return;
+        }
+
+        setIsUpdatingConfig(true);
+        try {
+            const nextState = !registrationLocked;
+            const res = await fetch("/api/system-config", {
+                method: "POST",
+                headers: headers(),
+                body: JSON.stringify({ locked: nextState })
+            });
+            const data = await res.json();
+            if (data.success) {
+                setRegistrationLocked(data.registrationLocked);
+                setMessage(data.registrationLocked ? "Public registration is now LOCKED." : "Public registration is now OPEN.");
+                setTimeout(() => setMessage(""), 3000);
+            } else {
+                setMessage(data.error || "Failed to update config.");
+            }
+        } catch (e) {
+            setMessage("Error updating configuration.");
+        } finally {
+            setIsUpdatingConfig(false);
+        }
+    };
 
     const formatSseUrl = (input: string): string => {
         let url = input.trim().replace(/\/+$/, ''); // trim and remove trailing slashes
@@ -783,6 +832,65 @@ export default function SettingsTab({ accessToken, accountTier, onTierChange }: 
                         </div>
                     )}
                 </div>
+            </div>
+            {/* Global Administration */}
+            <div style={{ marginTop: "4rem", paddingTop: "2rem", borderTop: "1px solid rgba(255,255,255,0.15)", marginBottom: "3rem" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginBottom: "1rem" }}>
+                    <h3 style={{ margin: 0 }}>Global Administration</h3>
+                    <span style={{ fontSize: "0.7rem", padding: "0.15rem 0.5rem", borderRadius: "10px", background: "rgba(59, 130, 246, 0.15)", color: "var(--accent-3)", border: "1px solid rgba(59,130,246,0.3)", fontWeight: 700, textTransform: "uppercase" }}>System Wide</span>
+                </div>
+
+                <div style={{ padding: "1.5rem", background: "rgba(0,0,0,0.2)", borderRadius: "12px", border: "1px solid var(--border-color)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ maxWidth: "70%" }}>
+                        <div style={{ fontWeight: 600, color: "var(--text-primary)", marginBottom: "0.35rem", display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                            {registrationLocked ? (
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2.5"><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>
+                            ) : (
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="2.5"><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 9.9-1" /></svg>
+                            )}
+                            Lock New Registrations
+                        </div>
+                        <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", lineHeight: 1.5, margin: 0 }}>
+                            When enabled, new users will not be able to create an account. Existing users can still sign in.
+                            Current registered users: <strong style={{ color: "var(--text-primary)" }}>{userCount}</strong>
+                        </p>
+                    </div>
+
+                    <button
+                        onClick={handleToggleRegistration}
+                        disabled={isUpdatingConfig}
+                        style={{
+                            width: "56px",
+                            height: "28px",
+                            borderRadius: "100px",
+                            background: registrationLocked ? "rgba(239, 68, 68, 0.2)" : "rgba(34, 197, 94, 0.2)",
+                            border: `1px solid ${registrationLocked ? "rgba(239,68,68,0.4)" : "rgba(34,197,94,0.4)"}`,
+                            position: "relative",
+                            cursor: "pointer",
+                            transition: "all 0.3s ease",
+                            padding: 0
+                        }}
+                    >
+                        <div style={{
+                            width: "20px",
+                            height: "20px",
+                            borderRadius: "50%",
+                            background: registrationLocked ? "#ef4444" : "#22c55e",
+                            position: "absolute",
+                            top: "50%",
+                            left: registrationLocked ? "calc(100% - 24px)" : "4px",
+                            transform: "translateY(-50%)",
+                            transition: "all 0.3s cubic-bezier(0.68, -0.55, 0.265, 1.55)",
+                            boxShadow: "0 0 8px rgba(0,0,0,0.3)"
+                        }} />
+                    </button>
+                </div>
+                {registrationLocked && (
+                    <div style={{ marginTop: "1rem", padding: "0.75rem 1rem", background: "rgba(234, 179, 8, 0.1)", border: "1px solid rgba(234, 179, 8, 0.25)", borderRadius: "8px", color: "#eab308", fontSize: "0.8rem", display: "flex", alignItems: "center", gap: "0.6rem" }}>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
+                        Security Tip: Registration is currently locked. Only users already in the database can access the platform.
+                    </div>
+                )}
             </div>
         </div>
     );
