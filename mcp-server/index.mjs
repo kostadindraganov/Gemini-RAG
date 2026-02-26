@@ -46,19 +46,20 @@ function addMcpLog(msg) {
 
 // ── Supabase helpers ──────────────────────────────────────────────────────────
 /**
- * Safe GET from Supabase REST API using the anon key (RLS applies).
- * params keys that start with a filter operator are passed as-is; plain keys
- * are automatically wrapped in eq.<value>  so callers don't have to.
+ * Safe GET from Supabase REST API.
+ * userToken: when provided, used as Bearer JWT so Supabase RLS sees auth.uid().
+ *            Falls back to anon key (for pre-session lookups like mcp_api_keys).
  */
-async function sbFetch(table, params = {}) {
+async function sbFetch(table, params = {}, userToken = null) {
     if (!SUPABASE_URL || !SUPABASE_ANON) return null;
     try {
         const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
         Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+        const bearerToken = userToken || SUPABASE_ANON;
         const res = await fetch(url.toString(), {
             headers: {
                 apikey: SUPABASE_ANON,
-                Authorization: `Bearer ${SUPABASE_ANON}`,
+                Authorization: `Bearer ${bearerToken}`,
                 "Accept": "application/json",
             }
         });
@@ -73,16 +74,17 @@ async function sbFetch(table, params = {}) {
     }
 }
 
-async function sbPatch(table, filter, body) {
+async function sbPatch(table, filter, body, userToken = null) {
     if (!SUPABASE_URL || !SUPABASE_ANON) return;
     try {
         const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
         Object.entries(filter).forEach(([k, v]) => url.searchParams.set(k, `eq.${v}`));
+        const bearerToken = userToken || SUPABASE_ANON;
         await fetch(url.toString(), {
             method: "PATCH",
             headers: {
                 apikey: SUPABASE_ANON,
-                Authorization: `Bearer ${SUPABASE_ANON}`,
+                Authorization: `Bearer ${bearerToken}`,
                 "Content-Type": "application/json",
             },
             body: JSON.stringify(body)
@@ -118,12 +120,14 @@ async function resolveUser(bearerToken) {
         return { userId: null, valid: false };
     }
 
+    // Use anon key for this lookup (no session yet); do NOT encodeURIComponent —
+    // url.searchParams.set() handles encoding automatically.
     const rows = await sbFetch("mcp_api_keys", {
-        "key_value": `eq.${encodeURIComponent(bearerToken)}`,
+        "key_value": `eq.${bearerToken}`,
         "is_active": "eq.true",
         "select": "id,user_id",
         "limit": "1",
-    });
+    }, null);
 
     if (!rows || rows.length === 0) return { userId: null, valid: false };
 
@@ -133,7 +137,7 @@ async function resolveUser(bearerToken) {
     authCache.set(bearerToken, { userId, expiresAt: Date.now() + AUTH_CACHE_TTL_MS });
 
     // Fire-and-forget last_used update
-    sbPatch("mcp_api_keys", { id }, { last_used_at: new Date().toISOString() }).catch(() => { });
+    sbPatch("mcp_api_keys", { id }, { last_used_at: new Date().toISOString() }, null).catch(() => { });
 
     return { userId, valid: true };
 }
@@ -143,7 +147,7 @@ async function resolveUser(bearerToken) {
 const settingsCache = new Map();
 const SETTINGS_CACHE_TTL_MS = 30_000; // 30 s
 
-async function getUserSettings(userId) {
+async function getUserSettings(userId, userToken = null) {
     if (!userId) return null;
 
     const cached = settingsCache.get(userId);
@@ -153,7 +157,7 @@ async function getUserSettings(userId) {
         "user_id": `eq.${userId}`,
         "select": "active_store_id,active_model,system_prompt",
         "limit": "1",
-    });
+    }, userToken);
     const data = rows?.[0] || null;
 
     settingsCache.set(userId, { data, expiresAt: Date.now() + SETTINGS_CACHE_TTL_MS });
@@ -164,9 +168,9 @@ function invalidateSettingsCache(userId) {
     settingsCache.delete(userId);
 }
 
-async function setActiveStore(userId, storeId) {
+async function setActiveStore(userId, storeId, userToken = null) {
     if (!userId || !storeId) return;
-    await sbPatch("user_settings", { user_id: userId }, { active_store_id: storeId });
+    await sbPatch("user_settings", { user_id: userId }, { active_store_id: storeId }, userToken);
     invalidateSettingsCache(userId);
 }
 
@@ -176,12 +180,12 @@ async function setActiveStore(userId, storeId) {
 //       is the single source of truth. Calling the Gemini API for every tool
 //       invocation is orders of magnitude slower.
 
-async function getStoresByUser(userId) {
+async function getStoresByUser(userId, userToken = null) {
     const rows = await sbFetch("stores", {
         "user_id": `eq.${userId}`,
         "select": "id,display_name,document_count",
         "order": "created_at.desc",
-    });
+    }, userToken);
     return (rows || []).map(r => ({
         id: r.id,
         displayName: r.display_name || r.id,
@@ -189,8 +193,8 @@ async function getStoresByUser(userId) {
     }));
 }
 
-async function findStoreByUser(userId, identifier) {
-    const stores = await getStoresByUser(userId);
+async function findStoreByUser(userId, identifier, userToken = null) {
+    const stores = await getStoresByUser(userId, userToken);
     const q = identifier.toLowerCase();
     return stores.find(s =>
         s.id.toLowerCase() === q ||
@@ -204,7 +208,7 @@ function toStoreName(id) {
 }
 
 // ── Document helpers (Supabase-backed) ───────────────────────────────────────
-async function getDocumentsByUser(userId, storeId, limit = 100) {
+async function getDocumentsByUser(userId, storeId, limit = 100, userToken = null) {
     const params = {
         "user_id": `eq.${userId}`,
         "select": "id,display_name,original_filename,store_id,mime_type",
@@ -212,7 +216,7 @@ async function getDocumentsByUser(userId, storeId, limit = 100) {
         "limit": String(Math.min(limit, 500)),
     };
     if (storeId) params["store_id"] = `eq.${storeId}`;
-    return (await sbFetch("documents", params)) || [];
+    return (await sbFetch("documents", params, userToken)) || [];
 }
 
 // ── Gemini RAG query ──────────────────────────────────────────────────────────
@@ -348,6 +352,10 @@ function resolveUserIdFromExtra(extra) {
     return resolveSessionFromExtra(extra)?.userId ?? null;
 }
 
+function resolveTokenFromExtra(extra) {
+    return resolveSessionFromExtra(extra)?.token ?? null;
+}
+
 // ── Tool registry ─────────────────────────────────────────────────────────────
 const tools = [];
 function registerTool(name, description, schema, handler) {
@@ -378,16 +386,17 @@ registerTool(
         model: z.string().optional().describe("Gemini model (default: gemini-2.5-flash)"),
     },
     async ({ message, storeId, model }, extra) => {
-        const userId = resolveUserIdFromExtra(extra);
+        const session = resolveSessionFromExtra(extra);
+        const userId = session?.userId;
         if (!userId) return err("No user session found.");
+        const tok = session.token;
 
         try {
-            const settings = await getUserSettings(userId);
+            const settings = await getUserSettings(userId, tok);
             const resolvedStoreId = storeId || settings?.active_store_id;
             if (!resolvedStoreId) return err("⚠️ No active store set. Use set_active_store first.");
 
-            // Verify the store belongs to this user
-            const store = await findStoreByUser(userId, resolvedStoreId);
+            const store = await findStoreByUser(userId, resolvedStoreId, tok);
             if (!store) return err(`Store "${resolvedStoreId}" not found or not accessible.`);
 
             const answer = await ragQuery({
@@ -413,14 +422,16 @@ registerTool(
         model: z.string().optional().describe("Gemini model"),
     },
     async ({ message, storeId, model }, extra) => {
-        const userId = resolveUserIdFromExtra(extra);
+        const session = resolveSessionFromExtra(extra);
+        const userId = session?.userId;
         if (!userId) return err("No user session found.");
+        const tok = session.token;
 
         try {
-            const store = await findStoreByUser(userId, storeId);
+            const store = await findStoreByUser(userId, storeId, tok);
             if (!store) return err(`Store "${storeId}" not found.`);
 
-            const settings = await getUserSettings(userId);
+            const settings = await getUserSettings(userId, tok);
             const answer = await ragQuery({
                 query: message,
                 storeNames: [toStoreName(store.id)],
@@ -443,14 +454,16 @@ registerTool(
         model: z.string().optional().describe("Gemini model"),
     },
     async ({ message, model }, extra) => {
-        const userId = resolveUserIdFromExtra(extra);
+        const session = resolveSessionFromExtra(extra);
+        const userId = session?.userId;
         if (!userId) return err("No user session found.");
+        const tok = session.token;
 
         try {
-            const stores = await getStoresByUser(userId);
+            const stores = await getStoresByUser(userId, tok);
             if (!stores.length) return err("No stores found. Create a store and upload files first.");
 
-            const settings = await getUserSettings(userId);
+            const settings = await getUserSettings(userId, tok);
             const answer = await ragQuery({
                 query: message,
                 storeNames: stores.map(s => toStoreName(s.id)),
@@ -470,13 +483,15 @@ registerTool(
     "List all your document stores with their IDs and document counts.",
     {},
     async (_, extra) => {
-        const userId = resolveUserIdFromExtra(extra);
+        const session = resolveSessionFromExtra(extra);
+        const userId = session?.userId;
         if (!userId) return err("No user session found.");
+        const tok = session.token;
 
         try {
             const [stores, settings] = await Promise.all([
-                getStoresByUser(userId),
-                getUserSettings(userId),
+                getStoresByUser(userId, tok),
+                getUserSettings(userId, tok),
             ]);
             if (!stores.length) return ok("No stores found. Create a store in the web UI first.");
 
@@ -497,13 +512,15 @@ registerTool(
     "Returns the currently active document store for this account.",
     {},
     async (_, extra) => {
-        const userId = resolveUserIdFromExtra(extra);
+        const session = resolveSessionFromExtra(extra);
+        const userId = session?.userId;
         if (!userId) return err("No user session found.");
+        const tok = session.token;
 
         try {
-            const settings = await getUserSettings(userId);
+            const settings = await getUserSettings(userId, tok);
             if (!settings?.active_store_id) return ok("No active store set. Use set_active_store.");
-            const stores = await getStoresByUser(userId);
+            const stores = await getStoresByUser(userId, tok);
             const store = stores.find(s => s.id === settings.active_store_id);
             return ok(`Active store: ${store?.displayName || settings.active_store_id}\nID: ${settings.active_store_id}`);
         } catch (e) { return err(e); }
@@ -518,13 +535,15 @@ registerTool(
     "Set the active document store by ID or display name.",
     { storeId: z.string().describe("Store ID or display name") },
     async ({ storeId }, extra) => {
-        const userId = resolveUserIdFromExtra(extra);
+        const session = resolveSessionFromExtra(extra);
+        const userId = session?.userId;
         if (!userId) return err("No user session found.");
+        const tok = session.token;
 
         try {
-            const store = await findStoreByUser(userId, storeId);
+            const store = await findStoreByUser(userId, storeId, tok);
             if (!store) return err(`Store "${storeId}" not found.`);
-            await setActiveStore(userId, store.id);
+            await setActiveStore(userId, store.id, tok);
             return ok(`✅ Active store set to: ${store.displayName} (${store.id})`);
         } catch (e) { return err(e); }
     }
@@ -541,19 +560,20 @@ registerTool(
         limit: z.number().int().min(1).max(200).optional().describe("Max results (default 50)"),
     },
     async ({ storeId, limit }, extra) => {
-        const userId = resolveUserIdFromExtra(extra);
+        const session = resolveSessionFromExtra(extra);
+        const userId = session?.userId;
         if (!userId) return err("No user session found.");
+        const tok = session.token;
 
         try {
-            const settings = await getUserSettings(userId);
+            const settings = await getUserSettings(userId, tok);
             const resolvedId = storeId || settings?.active_store_id;
             if (!resolvedId) return err("No storeId provided and no active store is set.");
 
-            // Verify store belongs to user
-            const store = await findStoreByUser(userId, resolvedId);
+            const store = await findStoreByUser(userId, resolvedId, tok);
             if (!store) return err(`Store "${resolvedId}" not found.`);
 
-            const docs = await getDocumentsByUser(userId, store.id, limit || 50);
+            const docs = await getDocumentsByUser(userId, store.id, limit || 50, tok);
             if (!docs.length) return ok(`Store "${store.displayName}" has no documents yet.`);
 
             const lines = docs.map((d, i) =>
@@ -576,15 +596,17 @@ registerTool(
         model: z.string().optional().describe("Gemini model"),
     },
     async ({ storeId, focus, model }, extra) => {
-        const userId = resolveUserIdFromExtra(extra);
+        const session = resolveSessionFromExtra(extra);
+        const userId = session?.userId;
         if (!userId) return err("No user session found.");
+        const tok = session.token;
 
         try {
-            const settings = await getUserSettings(userId);
+            const settings = await getUserSettings(userId, tok);
             const resolvedId = storeId || settings?.active_store_id;
             if (!resolvedId) return err("No active store set.");
 
-            const store = await findStoreByUser(userId, resolvedId);
+            const store = await findStoreByUser(userId, resolvedId, tok);
             if (!store) return err(`Store "${resolvedId}" not found.`);
 
             const prompt = focus
@@ -613,30 +635,28 @@ registerTool(
         storeId: z.string().optional().describe("Store ID. Uses active store if omitted."),
     },
     async ({ documentId, storeId }, extra) => {
-        const userId = resolveUserIdFromExtra(extra);
+        const session = resolveSessionFromExtra(extra);
+        const userId = session?.userId;
         if (!userId) return err("No user session found.");
+        const tok = session.token;
 
         try {
-            const settings = await getUserSettings(userId);
+            const settings = await getUserSettings(userId, tok);
             const resolvedId = storeId || settings?.active_store_id;
             if (!resolvedId) return err("Store ID required.");
 
-            // Ownership check: verify the document belongs to this user
-            const docs = await getDocumentsByUser(userId, resolvedId, 500);
+            const docs = await getDocumentsByUser(userId, resolvedId, 500, tok);
             const doc = docs.find(d => d.id === documentId);
             if (!doc) return err(`Document "${documentId}" not found in your store. Use list_documents to see available IDs.`);
 
-            // Delete from Gemini file search store
             const docGeminiName = `${toStoreName(resolvedId)}/documents/${documentId}`;
             try {
                 await ai.fileSearchStores.documents.delete({ name: docGeminiName });
             } catch (e) {
-                // 404 is fine — document may already be gone from Gemini
                 if (!e.message?.includes("404")) throw e;
             }
 
-            // Delete from Supabase (authoritative store)
-            await sbPatch("documents", { id: documentId, user_id: userId }, { deleted_at: new Date().toISOString() });
+            await sbPatch("documents", { id: documentId, user_id: userId }, { deleted_at: new Date().toISOString() }, tok);
 
             return ok(`✅ Deleted: ${doc.display_name || doc.original_filename || documentId}`);
         } catch (e) { return err(e); }
@@ -657,20 +677,18 @@ registerTool(
         const session = resolveSessionFromExtra(extra);
         if (!session?.userId) return err("No user session found.");
         const userId = session.userId;
-        const sessionToken = session.token;
+        const tok = session.token;
 
         try {
-            const settings = await getUserSettings(userId);
+            const settings = await getUserSettings(userId, tok);
             let activeStoreId = storeId || settings?.active_store_id || null;
             if (!activeStoreId) return err("No store specified and no active store set. Use set_active_store first.");
 
-            // Resolve store by name/id, verifying ownership
-            const store = await findStoreByUser(userId, activeStoreId);
+            const store = await findStoreByUser(userId, activeStoreId, tok);
             if (!store) return err(`Store "${activeStoreId}" not found.`);
             activeStoreId = store.id;
 
-            // Fetch document list from Supabase (authoritative; Gemini only has opaque names)
-            const docs = await getDocumentsByUser(userId, activeStoreId, 500);
+            const docs = await getDocumentsByUser(userId, activeStoreId, 500, tok);
             if (!docs.length) return err(`No documents found in store "${store.displayName}". Upload some files first.`);
 
             const q = documentId.toLowerCase().trim();
@@ -692,7 +710,7 @@ registerTool(
             }
 
             const viewUrl = `${APP_URL}/?tab=docs&storeId=${activeStoreId}&docId=${doc.id}`;
-            const downloadUrl = `${APP_URL}/api/stores/${activeStoreId}/documents/${doc.id}/download?token=${sessionToken}`;
+            const downloadUrl = `${APP_URL}/api/stores/${activeStoreId}/documents/${doc.id}/download?token=${tok}`;
 
             return ok(
                 `📄 ${doc.display_name || doc.original_filename || doc.id}\n\n` +
